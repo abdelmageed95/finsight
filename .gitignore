@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup
+infra/terraform/terraform.tfvars
+
+# Alembic
+alembic.ini.local
+
+# Docker
+docker/data/
+
+# Streamlit
+frontend/.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# ChromaDB local data
+chroma_data/
+
+.claude
+CLAUDE.md
+.github
+.pytest_cache
+
+Docs/
+evals/results
+todo.txt
+bugs.txt

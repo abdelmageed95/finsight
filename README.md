@@ -1,0 +1,752 @@
+# FinSight
+
+**An AI-powered financial research agent that ingests SEC filings and market data, and answers natural-language questions with cited, risk-scored research reports.**
+
+FinSight is a full-stack application built around a LangGraph multi-agent pipeline:
+
+1. A **Supervisor** classifies the user's message as a greeting, smalltalk, or a real research query. Greetings and smalltalk short-circuit to a fast reply; research queries run the full pipeline below.
+2. A **Data Agent** fetches prices, financials, SEC filings (10-K and 10-Q), and news. It uses a **multi-source fallback chain** (yfinance → Massive → Twelve Data → EODHD → Tiingo) with automatic **exchange suffix detection** so international / Middle East tickers (Tadawul, ADX, DFM, EGX, QSE, etc.) resolve without manual configuration. It respects per-source TTLs so repeat questions within the cache window return in seconds.
+3. A **RAG Agent** retrieves the most relevant filing chunks from the vector store and asks an LLM to answer the user's question with citations. Filings are **semantically chunked by SEC Item section** (Item 1A, 7, 7A, etc.) with **token-level splitting** (tiktoken, 512 tokens) and **HTML tables extracted as markdown**. In multi-turn conversations, prior turns are injected into the LLM prompt so the analysis builds on earlier context.
+4. A **Report Agent** formats the analysis into a structured, risk-scored research report.
+
+Conversations are persisted in Postgres — each chat is a `Conversation` with ordered `ConversationTurn` rows. Follow-up messages in the same conversation reuse the ticker context and Data Agent cache, and the RAG chain receives prior turns so it can produce continuity-aware answers.
+
+The whole pipeline runs behind a FastAPI backend, with a Next.js finance-terminal-style frontend on top. Everything runs locally in Docker Compose.
+
+---
+
+## Table of contents
+
+- [Architecture at a glance](#architecture-at-a-glance)
+- [Tech stack](#tech-stack)
+- [Repository layout](#repository-layout)
+- [Prerequisites](#prerequisites)
+- [Quick start (Docker Compose)](#quick-start-docker-compose)
+- [Environment variables](#environment-variables)
+- [Data lifecycle: ingestion, caching, and freshness](#data-lifecycle-ingestion-caching-and-freshness)
+- [Using the app](#using-the-app)
+- [API reference](#api-reference)
+- [Development workflow](#development-workflow)
+- [Database migrations](#database-migrations)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Project status](#project-status)
+
+---
+
+## Architecture at a glance
+
+```
+                           ┌───────────────────────┐
+                           │   Next.js frontend    │
+                           │  home / ticker        │
+                           │  workspace / compare  │
+                           └───────────┬───────────┘
+                                       │  REST + JWT
+                           ┌───────────▼───────────┐
+                           │   FastAPI backend     │
+                           │  /analyze  /report    │
+                           │  /ticker   /history   │
+                           │  /conversations       │
+                           │  /analyze/compare     │
+                           │  /auth     /health    │
+                           └───────────┬───────────┘
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              │                        │                        │
+   ┌──────────▼──────────┐   ┌─────────▼──────────┐   ┌─────────▼─────────┐
+   │  LangGraph graph    │   │     Postgres       │   │     ChromaDB      │
+   │                     │   │  tickers, prices,  │   │  filing-chunk     │
+   │  supervisor         │   │  filings (+hash),  │   │  embeddings       │
+   │    ├─ smalltalk ────┤   │  chunks, reports,  │   │                   │
+   │    └─ data → rag    │   │  news_articles,    │   │                   │
+   │         → report    │   │  conversations,    │   │                   │
+   │                     │   │  conversation_turns│   │                   │
+   └──────────┬──────────┘   └────────────────────┘   └───────────────────┘
+              │
+   ┌──────────▼──────────────────────────┐
+   │   External APIs (with fallback)     │
+   │  Anthropic (LLM), OpenAI (embed),   │
+   │  SEC EDGAR                          │
+   │  Prices/Financials:                 │
+   │    yfinance → Massive → Twelve Data │
+   │    → EODHD → Tiingo                 │
+   │  News: Alpha Vantage → Massive      │
+   │    → EODHD → Tiingo                 │
+   └─────────────────────────────────────┘
+```
+
+The graph is wired in `agents/orchestrator.py`; each node lives in its own file under `agents/`. The retrieval chain is in `rag/chain.py`.
+
+**Models.** Every LLM call — intent classification, smalltalk, RAG report generation, stock comparison, and the eval LLM-as-judge — runs on **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`). OpenAI is used **only** for embeddings (`text-embedding-3-large`). Nothing else touches OpenAI for generation.
+
+**Routing at a glance.** The supervisor runs a cheap Claude Haiku 4.5 classifier (with a zero-cost regex fast path for obvious greetings like `hi`/`thanks`) and sends the turn down one of two branches:
+
+- `greeting` / `smalltalk` → `smalltalk_agent` produces a short conversational reply and ends. No data fetch, no RAG, no risk score. Typical latency: 2–3 s.
+- `research_query` → `data_agent` → `rag_agent` → `report_agent`. Typical latency: 8–30 s depending on cache state.
+
+**Data freshness policy.** The Data Agent reads `tickers.updated_at` and skips ingestion pipelines whose data is still inside their TTL:
+
+| Source        | TTL     | Who touches it                |
+|---------------|---------|-------------------------------|
+| Market data   | 15 min  | `ingest_market_data` bumps `updated_at` |
+| SEC filings   | 24 h    | same timestamp, longer window |
+| Embeddings    | hash-based | re-embed only when `Filing.content_hash` changes |
+
+An `APScheduler` job (`SCHEDULER_ENABLED=true` by default) also refreshes every tracked ticker every 6 hours, so users returning after days see fresh data immediately on their first query. Users can also hit the **"Refresh"** button on a workspace's Overview tab to re-pull prices + news immediately without regenerating the report.
+
+**International coverage.** yfinance handles US tickers out of the box; for other markets the Data Agent auto-tries exchange suffixes (`.SR` Tadawul, `.AE` ADX/DFM, `.QA` Qatar, `.KW` Kuwait, `.BH` Bahrain, `.CA` Egypt, `.L` London, `.TO` Toronto, `.HK` Hong Kong), then falls through to Massive, Twelve Data, EODHD, and Tiingo in order. EODHD in particular has strong Middle East + EMEA coverage (70+ exchanges).
+
+---
+
+## Tech stack
+
+**Backend**
+- Python 3.12, FastAPI, Uvicorn
+- LangChain + LangGraph (multi-agent orchestration with checkpointing)
+- SQLAlchemy 2 (async) + asyncpg + Alembic
+- ChromaDB (vector store, `text-embedding-3-large`, 3072 dims)
+- **Anthropic Claude Haiku 4.5** (`claude-haiku-4-5-20251001`) — every LLM call: classification, RAG generation, comparison, eval judge
+- OpenAI — embeddings only (`text-embedding-3-large`); tiktoken (token-level chunking)
+- BeautifulSoup (SEC filing section parsing + HTML table → markdown extraction)
+- **Market data (multi-source fallback)**: yfinance, Massive (Polygon.io), Twelve Data, EODHD, Tiingo
+- SEC EDGAR (10-K / 10-Q filings — latest 4 per ticker: most recent 10-K + 3 recent 10-Qs, downloaded concurrently with retry/backoff)
+- sentence-transformers cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`), loaded once per process
+- **News (multi-source fallback)**: Alpha Vantage, Massive, EODHD, Tiingo
+- Redis (cache, scheduler locks)
+- JWT auth (email/password + Google OAuth), structlog, slowapi rate limiting
+
+**Frontend**
+- Next.js 16 (App Router, standalone output)
+- React 19, TypeScript (strict)
+- Tailwind CSS v4 + CSS custom properties
+- TanStack Query v5
+- TradingView Lightweight Charts (candlestick + SMA/Bollinger overlays)
+- html2canvas-pro + jsPDF (client-side PDF export)
+- Radix UI primitives, lucide-react, Geist fonts
+- Zod schemas mirroring the Pydantic models
+
+**Infrastructure (local)**
+- Docker Compose: `postgres`, `redis`, `chromadb`, `app`, `frontend`
+- Multi-stage Dockerfiles for both backend (Python slim) and frontend (Node Alpine standalone)
+
+---
+
+## Repository layout
+
+```
+Finsight/
+├── api/                   FastAPI app, routers, schemas, auth
+│   ├── main.py
+│   ├── dependencies.py    DbSession, CurrentUser (JWT)
+│   ├── schemas.py         Pydantic request/response models
+│   └── routers/           analyze, report, ticker, history, conversations, auth, health
+├── agents/                LangGraph nodes
+│   ├── orchestrator.py    StateGraph wiring, supervisor w/ intent classifier, smalltalk node
+│   ├── data_agent.py      Fetches market data + SEC filings (with TTL cache)
+│   ├── rag_agent.py       Retrieves chunks, calls LLM
+│   └── report_agent.py    Formats the final report
+├── rag/                   Retrieval chain, reranker, prompts, vector store
+│   ├── schemas.py         ReportSchema (SWOT, bull/bear, risk breakdown), ComparisonReport
+│   ├── temporal.py        Extracts target fiscal year(s) from a query
+│   └── prompts.py         RAG + comparison system prompts
+├── pipelines/             market_data, sec_filings, embedder, cleaner, scheduler, hashing
+│   ├── massive.py         Massive (Polygon.io) — OHLCV, profile, financials, news
+│   ├── twelvedata.py      Twelve Data — OHLCV, profile, statistics (Middle East coverage)
+│   ├── eodhd.py           EODHD — OHLCV, fundamentals, quarterly, news (70+ exchanges)
+│   ├── tiingo.py          Tiingo — OHLCV, profile, news (US-focused fallback)
+│   └── news_fetcher.py    Multi-source news sentiment → DB persistence
+├── db/
+│   ├── models.py          SQLAlchemy models (tickers, prices, filings, chunks, reports, news_articles, conversations, turns)
+│   ├── session.py         Async engine + session factory
+│   ├── crud.py
+│   └── migrations/        Alembic revisions
+├── frontend/              Next.js app
+│   ├── src/app/(app)/     home, workspace/[ticker], compare routes (+ legacy redirects)
+│   ├── src/components/    finsight/* (workspace-view, workspace-overview/research/chat, home-view, …), ui/*
+│   ├── src/lib/           api client, zod schemas, utils
+│   └── Dockerfile
+├── tests/
+│   ├── unit/              agents, pipelines, rag
+│   ├── integration/       API end-to-end
+│   └── evals/             offline LLM eval harness (dataset, scorers, runner)
+├── scripts/
+│   └── ingest_ticker.py   Manual ingestion of a single ticker
+├── docker/
+│   └── docker-compose.yml Full local stack
+├── Dockerfile             Backend image
+├── alembic.ini
+├── requirements.txt
+├── requirements-dev.txt
+└── Docs/project_proposal.md
+```
+
+---
+
+## Prerequisites
+
+- Docker and Docker Compose (Compose v2, `docker compose ...`)
+- An **Anthropic API key** (required — every LLM call runs on Claude Haiku 4.5)
+- An **OpenAI API key** (required — used only for embeddings)
+- ~4 GB free disk for images and the `pgdata` / `chromadata` volumes
+- Free local ports: `3000`, `5433`, `6379`, `8000`, `8100`
+
+If you want to run the backend or frontend outside Docker, you additionally need Python 3.12 and Node 20.
+
+---
+
+## Quick start (Docker Compose)
+
+From the project root:
+
+```bash
+# 1. Create .env in the project root (see next section for all vars)
+cat > .env <<'EOF'
+ANTHROPIC_API_KEY=sk-ant-...your-key...
+OPENAI_API_KEY=sk-proj-...your-key...
+JWT_SECRET_KEY=change-me-to-a-long-random-string
+EOF
+
+# 2. Build and start the full stack
+docker compose -f docker/docker-compose.yml up -d --build
+
+# 3. Check everything is healthy
+docker compose -f docker/docker-compose.yml ps
+```
+
+You should see five services, all `healthy`:
+
+| Service  | URL / port                  | What it is                  |
+|----------|------------------------------|-----------------------------|
+| frontend | http://localhost:3000        | Next.js UI                  |
+| app      | http://localhost:8000        | FastAPI backend             |
+| postgres | localhost:5433               | Postgres 16                 |
+| redis    | localhost:6379               | Redis 7                     |
+| chromadb | http://localhost:8100        | Chroma vector store         |
+
+Alembic migrations run automatically on app startup (`alembic upgrade head`).
+
+Logs:
+
+```bash
+docker compose -f docker/docker-compose.yml logs -f app
+docker compose -f docker/docker-compose.yml logs -f frontend
+```
+
+Stop the stack:
+
+```bash
+docker compose -f docker/docker-compose.yml down          # keep volumes
+docker compose -f docker/docker-compose.yml down -v       # wipe postgres + chroma data
+```
+
+---
+
+## Environment variables
+
+The `app` service loads variables from `.env` at the **project root** via `env_file: ../.env`. Do not put the `.env` inside `docker/` — Compose reads its own `.env` from that directory for variable substitution, which is a separate concern.
+
+| Variable             | Required | Default                                        | Notes                                   |
+|----------------------|----------|------------------------------------------------|-----------------------------------------|
+| `ANTHROPIC_API_KEY`  | yes      | —                                              | All LLM calls (Claude Haiku 4.5). `CLAUDE_API_KEY` is also accepted as an alias. |
+| `OPENAI_API_KEY`     | yes      | —                                              | Embeddings only (`text-embedding-3-large`) |
+| `JWT_SECRET_KEY`     | yes      | `change-me-in-production`                      | Signing key for JWT access tokens       |
+| `DATABASE_URL`       | no       | `postgresql+asyncpg://finsight:finsight@postgres:5432/finsight` | Set by Compose inside the container |
+| `REDIS_URL`          | no       | `redis://redis:6379/0`                         | Set by Compose                          |
+| `CHROMA_HOST`        | no       | `chromadb`                                     | Set by Compose                          |
+| `CHROMA_PORT`        | no       | `8000`                                         | Container-side port                     |
+| `CORS_ORIGINS`       | no       | `http://localhost:3000,http://127.0.0.1:3000`  | Comma-separated list                    |
+| `SCHEDULER_ENABLED`  | no       | `true`                                         | APScheduler refreshes all tracked tickers every 6 h. Set to `false` to disable. |
+| `ALPHA_VANTAGE_API_KEY` | no    | —                                              | News sentiment (primary). Free tier: 25 requests/day. |
+| `MASSIVE_API_KEY`    | no       | —                                              | Massive (Polygon.io) — OHLCV + financials + news fallback #2 |
+| `TWELVEDATA_API_KEY` | no       | —                                              | Twelve Data — OHLCV + profile fallback (strong Middle East coverage) |
+| `EODHD_API_KEY`      | no       | —                                              | EODHD — OHLCV + fundamentals fallback for 70+ exchanges |
+| `TIINGO_API_KEY`     | no       | —                                              | Tiingo — OHLCV + news fallback (US-focused)  |
+| `GOOGLE_CLIENT_ID` | no       | —                                              | Required for Google OAuth login         |
+| `NEXT_PUBLIC_API_URL`| no       | `http://localhost:8000`                        | Baked into the frontend at build time   |
+
+Any other keys in your `.env` (e.g. extra third-party data providers) are also passed through into the container via `env_file`.
+
+---
+
+## Data lifecycle: ingestion, caching, and freshness
+
+The pipeline can answer questions only for tickers whose filings have been ingested into Postgres and embedded into Chroma. There are three ways data enters the system — and an explicit freshness policy that governs when it gets refreshed.
+
+### How data is ingested
+
+**1. Automatic ingestion via `/analyze` (Data Agent).**
+Every research request runs through the Data Agent, which fetches:
+
+1. Prices, financials, and quarterly periods — tries yfinance first (with exchange-suffix auto-detection for international tickers), then falls through the provider chain (Massive → Twelve Data → EODHD → Tiingo) until one returns data. The `price_source` / `financials_source` fields in the result record which provider actually served the request.
+2. Recent 10-K **and** 10-Q filings from SEC EDGAR (**latest 4 per company** — most recent 10-K plus the last three 10-Qs). Filings are downloaded concurrently (capped at 4 in-flight) with retry-and-backoff on SEC throttling; already-stored filings are skipped, so history accrues across runs. The SEC `reportDate` (the fiscal period a filing *covers*, distinct from its filing date) is captured and stored on each filing.
+3. News sentiment via the Alpha Vantage → Massive → EODHD → Tiingo fallback chain.
+4. Filings are **section-aware-chunked** (split by SEC Item headers, tables extracted as markdown), **token-chunked** at 512 tokens with 64-token overlap (tiktoken `cl100k_base`), and embedded with `text-embedding-3-large` into ChromaDB. Each chunk is prefixed with a temporal/provenance header (e.g. `[NVDA · 10-K · FY2025 · Item 7]`) and tagged with a `fiscal_year` metadata field — see [Temporal retrieval](#temporal-retrieval-getting-the-right-year) below.
+
+First-time ingestion for a new ticker takes ~30–60 seconds. On subsequent requests, the agent consults the cache (see below) and skips whatever is still fresh — repeat queries on the same ticker complete in ~6–10 seconds.
+
+**1b. On-demand refresh from the workspace.**
+The workspace Overview tab's **"Refresh"** button calls `POST /ticker/{symbol}/refresh`, which runs `ingest_market_data` + `ingest_news` only (no LLM, no report). This is the right escape hatch when a user returns after a few days and wants fresh prices/news without burning time regenerating an entire report.
+
+**2. Background scheduler.**
+With `SCHEDULER_ENABLED=true` (the default), an APScheduler job in `pipelines/scheduler.py` re-runs the full ingestion pipeline for every ticker in the `tickers` table every 6 hours. This keeps tracked companies warm so users returning after days still see current data on their first query.
+
+**3. Manual CLI ingestion.**
+For batch seeding or quickly populating a fresh install:
+
+```bash
+docker compose -f docker/docker-compose.yml exec app \
+  python -m scripts.ingest_ticker AAPL MSFT TSLA
+```
+
+This writes to Postgres **and** Chroma, so later analyze requests go straight into the RAG path without waiting for the Data Agent.
+
+### Cache policy — how long is data cached?
+
+There is no blanket TTL. Each data source has its own freshness window, and the Data Agent decides per request whether to re-fetch:
+
+| Source              | TTL         | Refresh trigger                                                  |
+|---------------------|-------------|------------------------------------------------------------------|
+| Prices + financials | **15 min**  | `tickers.updated_at` older than 15 min → `ingest_market_data` runs (also upserts the current-year financials row, so values actually refresh) |
+| SEC filings         | **24 h**    | `tickers.updated_at` older than 24 h → `ingest_sec_filings` runs a fresh EDGAR lookup |
+| Embeddings          | hash-based  | `Filing.content_hash != Filing.embedded_content_hash` → old chunks are purged from Postgres and Chroma, then re-embedded |
+| Full refresh        | **6 h**     | Scheduler re-runs everything for all tracked tickers             |
+
+**Worked example — a user comes back after 3 days:**
+
+1. They ask "what are AAPL's recent risks?".
+2. `tickers.updated_at` for AAPL is > 24 h old → Data Agent calls both `ingest_market_data` (new prices + refreshed FY financials) and `ingest_sec_filings` (new 10-Q if one was published).
+3. If a new 10-Q was downloaded, its SHA-256 is different from the stored `embedded_content_hash` → the embedder purges old chunks + Chroma vectors and re-embeds.
+4. RAG and Report agents then run against the fresh corpus.
+
+Total extra latency vs a warm request: roughly the ingestion time for whatever was actually stale (often 10–30 s). Everything else is skipped as a cache hit.
+
+**Worked example — a user asks two questions within a minute:**
+
+1. First call ingests + runs the full pipeline (~15–30 s).
+2. Second call sees `updated_at` within the 15 min window → both `ingest_market_data` and `ingest_sec_filings` return `{"skipped": true, "reason": "fresh"}`. Embedder short-circuits because nothing is pending. Only RAG + Report run. Total ~6–10 s.
+
+### Temporal retrieval: getting the right year
+
+Dense embeddings encode *topic*, not discrete facts: "2024" and "2025" produce near-identical vectors. So a question about FY2025 can retrieve a more semantically-similar FY2024 chunk and answer with the wrong year's numbers. FinSight defends against this in four layers:
+
+1. **Period capture** — at ingestion, SEC's `reportDate` (the fiscal period a filing covers, *not* its filing date — a 10-K filed Feb 2025 reports on the prior fiscal year) is stored on `Filing.period_of_report`.
+2. **Year in the chunk** — every chunk is prefixed with a temporal header (`[NVDA · 10-K · FY2025 · Item 7 (MD&A)]`) *before* embedding, so the year is encoded in the vector and visible to the cross-encoder reranker. Each chunk also carries a `fiscal_year` metadata tag.
+3. **Query time-intent** — `rag/temporal.py` parses the target year(s) from the question: explicit years, `FY25` notation, and relative phrases ("last year"). "Latest" / "most recent" deliberately yield no year — that's handled by latest-filing filtering, not a hard year filter.
+4. **Soft metadata filter** — when the query targets specific year(s), retrieval applies a hard ChromaDB `fiscal_year` filter so a wrong-year chunk simply isn't in the candidate set. If the filter returns too few chunks (missing/legacy metadata), it **relaxes to an unfiltered search** so a question is never starved of context.
+
+Because the `fiscal_year` tag lives in chunk metadata, filings embedded before this feature shipped won't match a year filter — the soft fallback keeps them usable, and re-embedding (or a fresh ingest) populates the tag.
+
+### Handling greetings and smalltalk
+
+The supervisor classifies every turn before touching the Data Agent. If a user says `hi`, `thanks`, or `what can you do?`, the request is routed to a dedicated `smalltalk_agent` that returns a short conversational reply in ~2–3 s — no ingestion, no RAG, no risk score. Real research questions still go through the full pipeline.
+
+The classifier uses Claude Haiku 4.5 with structured output, plus a zero-cost regex fast path for unambiguous short greetings. On classification failure it defaults to `research_query` so genuine questions are never brushed off.
+
+### Multi-turn conversations
+
+Every chat session is a **persistent conversation** backed by `conversations` and `conversation_turns` tables in Postgres. When a user sends a follow-up message:
+
+1. The user turn is saved immediately.
+2. Prior turns from the same conversation are loaded and passed into the LangGraph state as `prior_turns`.
+3. The Data Agent still runs but benefits from TTL cache hits — if the ticker data is already fresh, both market and SEC pipelines are skipped.
+4. The RAG chain injects prior turns (capped at the last 10) into the LLM prompt between the system message and the current user message, so the analysis can reference earlier questions and answers.
+5. The assistant turn (including the `job_id` linking to the full `AnalysisReport`) is persisted after completion.
+
+Conversations survive across browser sessions — clicking a conversation in the sidebar reloads all its turns from the API.
+
+---
+
+## Using the app
+
+Open **http://localhost:3000**. Register with email/password or sign in with Google OAuth. The backend uses JWT-based auth (`POST /auth/register`, `POST /auth/login`, `POST /auth/google`).
+
+The app is organised around a **ticker workspace** — one page per company that unifies live data, AI reports, and chat so a new user always knows where each kind of information lives. There are three top-level destinations:
+
+### `/home` — launcher + activity feed
+
+The logged-in landing page:
+- **Ticker launcher** — search any US public company by ticker or name.
+- **Popular chips** — one click into common tickers (AAPL, NVDA, TSLA, …).
+- **Activity feed** — "Starred" and "Recently run" reports across all tickers, filterable by ticker or question. Each row links straight into that report inside its workspace.
+
+### `/workspace/{ticker}` — the ticker workspace
+
+A **sticky header** shared across all tabs shows the ticker, live price, day-change badge, sector/industry, and the **Compare** and **Generate report** actions. The header's **Refresh** button (re-pulls prices + news only — no LLM, no report) appears on the Overview tab only. The active tab lives in the URL (`?tab=overview|research|chat`), so any view is linkable and shareable.
+
+- **Overview tab — live market data, no AI.**
+  - **KPIs**: market cap, P/E ratio, revenue, net income, EPS, gross margin, and a 30-day rolling volatility sparkline.
+  - **Candlestick chart**: TradingView Lightweight Charts with volume bars and toggle-able SMA(20), SMA(50), and Bollinger Band overlays.
+  - **Financial trends**: Revenue vs Net Income bar chart + Gross Margin sparkline across quarterly/annual periods.
+  - **Filing timeline**: vertical timeline of 10-K/10-Q filings with SEC links.
+  - **Peer comparison**: side-by-side table of sector peers (price, market cap, P/E, margin, day change).
+  - **Metrics trend**: AI-extracted metrics across multiple re-analyses.
+  - **News sentiment**: recent articles with color-coded sentiment dots and an average sentiment badge.
+  - **Institutional holders**, **earnings calendar** (EPS beat/miss bars with surprise %), and **dividends** (yield, payout ratio, annual history — hidden for non-dividend stocks).
+  - **Suggested questions** that jump straight into the Chat tab, and a thin **latest-report tile** linking into Research.
+
+- **Research tab — AI-generated reports.**
+  - A horizontal **picker of past reports, one entry per distinct question**. Re-running the *same* question overwrites its report; a *different* question is kept as its own report. Failed and superseded ("overwritten") runs are hidden.
+  - Selecting a report renders the full detail view:
+    - **Sticky TOC sidebar** (desktop) with scroll-to anchor links, and independently **collapsible sections**.
+    - **Price snapshot strip**: live price, day change, market cap, 30-day sparkline.
+    - **Executive summary** banner with the TL;DR verdict.
+    - Summary, **risk gauge**, and risk breakdown (operational/financial/market/legal sub-scores). When retrieval is too sparse to judge risk honestly, the score is shown as **"Insufficient data"** rather than a fabricated placeholder.
+    - **SWOT** 2×2 grid, **bull vs bear** thesis cards, **revenue segmentation** bars with trend indicators, **competitive moat** card with wide/narrow/none badge, **valuation verdict** badge, **catalysts** with impact-colored icons, **management assessment** card.
+    - Key metrics with trend arrows, cited sources, a collapsed **market context** section (news + peers), and **follow-up question** suggestions.
+    - **Share as image** (Web Share API → PNG fallback), **PDF export** (multi-page A4), and **JSON download**.
+  - **Re-analysis**: if a report already exists for a ticker, the Generate dialog offers "View existing" or re-running.
+
+- **Chat tab — lightweight RAG chat (no pipeline).** Each ticker gets one persistent conversation per user. Messages query the vector store directly and return an answer with citations — no report is created. Prior turns provide multi-turn context. The Overview tab's suggested questions and a `?q=` URL param can pre-fill the chat input.
+
+### `/compare`
+
+Side-by-side stock comparison. Enter two tickers to generate a structured comparison with metric-by-metric analysis (with winner highlighting) and an investment recommendation. Requires existing reports for both tickers for best results.
+
+> **Legacy routes.** The pre-refactor pages still resolve: `/dashboard/{ticker}` → workspace Overview, `/reports` → `/home`, `/reports/{id}` and `/chat` → the matching workspace tab. Old bookmarks keep working.
+
+Typical latency:
+
+- **Greeting / smalltalk** — 2–3 s (smalltalk agent short-circuit).
+- **Research query, cache hit** — 6–10 s (data skipped, RAG + Report only).
+- **Research query, cold or stale** — 15–40 s depending on how much needs re-ingesting.
+
+---
+
+## API reference
+
+All non-public routes require a `Bearer` token from the auth endpoints.
+
+| Method | Path                | Body / params                              | Description                                           |
+|--------|---------------------|--------------------------------------------|-------------------------------------------------------|
+| GET    | `/health`           | —                                          | Liveness probe (db, redis, chroma status)             |
+| POST   | `/auth/register`    | `{ "email", "password", "name?" }`         | Register a new account, returns JWT                   |
+| POST   | `/auth/login`       | `{ "email", "password" }`                  | Login, returns JWT                                    |
+| POST   | `/auth/google`      | `{ "id_token" }`                           | Google OAuth login, returns JWT                       |
+| POST   | `/analyze`          | `{ "ticker": "AAPL", "question": "..." }`  | Kick off the full research pipeline in the background. Auto-creates a conversation for the user+ticker. |
+| GET    | `/analyze/check/{ticker}` | —                                    | Check if a completed analysis exists for this user+ticker |
+| POST   | `/analyze/compare`  | `{ "ticker_a": "AAPL", "ticker_b": "MSFT" }` | Compare two tickers side-by-side (background task)  |
+| GET    | `/report/{job_id}`  | —                                          | Poll report status. Completed reports include summary, risk score/breakdown, SWOT, bull/bear case, key metrics, citations. |
+| GET    | `/report/{job_id}/compare` | —                                   | Poll comparison report (metric comparisons, recommendation) |
+| GET    | `/history`          | `?ticker=X&limit=N`                       | Recent analysis jobs, filterable by ticker            |
+| GET    | `/ticker/{symbol}`  | `?days=N`                                  | Metadata + prices + financials (all periods) + filings (up to 20) |
+| POST   | `/ticker/{symbol}/refresh` | —                                    | Re-pull prices + news using the multi-source fallback chain. No LLM / no report. Used by the workspace Overview "Refresh" button. |
+| GET    | `/ticker/{symbol}/peers` | —                                      | Sector peer comparison (5 peers, live yfinance data)  |
+| GET    | `/ticker/{symbol}/news` | `?limit=N`                              | Recent news articles with sentiment scores            |
+| GET    | `/ticker/{symbol}/holders` | —                                    | Top 10 institutional holders (live yfinance)          |
+| GET    | `/ticker/{symbol}/earnings` | —                                   | Earnings calendar + EPS surprise history              |
+| GET    | `/ticker/{symbol}/dividends` | —                                  | Dividend yield, payout ratio, annual history          |
+| POST   | `/conversations`    | `{ "title": "...", "ticker": "AAPL" }`     | Create a new conversation                             |
+| GET    | `/conversations`    | —                                          | List conversations (most recent first)                |
+| GET    | `/conversations/{id}` | —                                        | Get a conversation with all its turns                 |
+| GET    | `/conversations/by-ticker/{ticker}` | —                          | Find-or-create conversation for a ticker              |
+| POST   | `/conversations/{id}/messages` | `{ "question": "..." }`         | Lightweight RAG query — returns answer + citations directly (no report created). Prior turns provide multi-turn context. |
+
+Interactive docs: **http://localhost:8000/docs** (Swagger UI) and **http://localhost:8000/redoc**.
+
+### Example — full analysis round-trip
+
+```bash
+# 1. Register and get a token
+TOKEN=$(curl -s -X POST http://localhost:8000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"demo@example.com","password":"demo1234","name":"Demo"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+# Or login if already registered:
+# TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
+#   -H 'Content-Type: application/json' \
+#   -d '{"email":"demo@example.com","password":"demo1234"}' \
+#   | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+
+# 2. Submit a job
+JOB=$(curl -s -X POST http://localhost:8000/analyze \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"ticker":"AAPL","question":"What are the main revenue risks?"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['job_id'])")
+echo "Job: $JOB"
+
+# 3. Poll until complete
+while true; do
+  STATUS=$(curl -s http://localhost:8000/report/$JOB \
+    -H "Authorization: Bearer $TOKEN" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  echo "status=$STATUS"
+  [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ] && break
+  sleep 5
+done
+
+# 4. Fetch the final report
+curl -s http://localhost:8000/report/$JOB \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+### Example — multi-turn conversation (lightweight RAG chat)
+
+```bash
+# 1. Create a conversation
+CONV=$(curl -s -X POST http://localhost:8000/conversations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"TSLA risks","ticker":"TSLA"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "Conversation: $CONV"
+
+# 2. Send first message (lightweight RAG — returns answer directly, no report)
+curl -s -X POST http://localhost:8000/conversations/$CONV/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What are the main revenue risks for Tesla?"}' \
+  | python3 -m json.tool
+# Returns: { "answer": "...", "citations": [...], "confidence": "high" }
+
+# 3. Send a follow-up (prior turns injected for context)
+curl -s -X POST http://localhost:8000/conversations/$CONV/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"How do those compare to their competition risks?"}' \
+  | python3 -m json.tool
+
+# 4. Fetch the conversation with all turns
+curl -s http://localhost:8000/conversations/$CONV \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+### Example — stock comparison
+
+```bash
+# Compare two tickers (both must have existing reports for best results)
+COMP=$(curl -s -X POST http://localhost:8000/analyze/compare \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"ticker_a":"AAPL","ticker_b":"MSFT"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['job_id'])")
+
+# Poll until complete
+while true; do
+  STATUS=$(curl -s http://localhost:8000/report/$COMP/compare \
+    -H "Authorization: Bearer $TOKEN" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['status'])")
+  echo "status=$STATUS"
+  [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ] && break
+  sleep 5
+done
+
+# Fetch the comparison
+curl -s http://localhost:8000/report/$COMP/compare \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## Development workflow
+
+There are two ways to run FinSight: **dev mode** (hot-reload, for active development) and **Docker mode** (production-like, for final testing).
+
+### Dev mode (recommended during development)
+
+In dev mode, only the databases run in Docker. The backend and frontend run natively on your machine with **hot-reload** — every code change is reflected instantly without rebuilding anything.
+
+```bash
+# One command to start everything:
+./scripts/dev.sh
+```
+
+This will:
+1. Start Postgres, Redis, and ChromaDB in Docker (lightweight, no rebuild needed)
+2. Run Alembic migrations
+3. Start FastAPI with `--reload` — edit any Python file, the server restarts in ~1 second
+4. Start Next.js with `npm run dev` — edit any TSX/CSS file, the browser updates instantly (HMR)
+
+```
+  API:      http://localhost:8000
+  Frontend: http://localhost:3000
+  Swagger:  http://localhost:8000/docs
+```
+
+You can also start pieces individually:
+
+```bash
+./scripts/dev.sh infra    # just databases
+./scripts/dev.sh api      # just backend (hot-reload)
+./scripts/dev.sh web      # just frontend (hot-reload)
+./scripts/dev.sh stop     # stop everything
+```
+
+Press `Ctrl+C` to stop all processes.
+
+#### First-time setup
+
+Before running dev mode for the first time, install dependencies:
+
+```bash
+# Python
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+
+# Frontend
+cd frontend && npm install && cd ..
+
+# Create .env (see Environment variables section)
+cp .env.example .env  # then fill in your API keys
+```
+
+### Docker mode (production build)
+
+Use Docker mode when you're done developing and want to test the full production-like stack, or for deployment:
+
+```bash
+# Build and start everything in Docker:
+docker compose -f docker/docker-compose.yml up -d --build
+
+# Stop:
+docker compose -f docker/docker-compose.yml down          # keep data
+docker compose -f docker/docker-compose.yml down -v       # wipe data
+```
+
+### When to use which
+
+| Scenario | Mode | Why |
+|----------|------|-----|
+| Writing code, fixing bugs | Dev mode | Instant feedback, no rebuild wait |
+| Testing a new component | Dev mode | HMR shows changes in the browser immediately |
+| Changing Python logic | Dev mode | Uvicorn auto-restarts in ~1s |
+| Final testing before deploy | Docker mode | Matches production environment |
+| Sharing with others | Docker mode | Single command, no local setup needed |
+| Adding a new migration | Dev mode | Run `alembic revision --autogenerate -m "..."` directly |
+
+> **Note:** Next.js 16 has breaking changes versus previous major versions. If you need to look up an API, read the docs shipped under `frontend/node_modules/next/dist/docs/` rather than relying on older guides.
+
+---
+
+## Database migrations
+
+Alembic is configured in `alembic.ini` with scripts under `db/migrations/`.
+
+```bash
+# In Docker:
+docker compose -f docker/docker-compose.yml exec app alembic upgrade head
+docker compose -f docker/docker-compose.yml exec app alembic revision --autogenerate -m "add foo"
+
+# Locally (with DATABASE_URL pointing at localhost:5433):
+alembic upgrade head
+alembic revision --autogenerate -m "add foo"
+```
+
+Migrations run automatically at container startup via the `app` service's command.
+
+---
+
+## Testing
+
+```bash
+# Unit tests (no external services required for most)
+pytest tests/unit -v
+
+# Integration tests — requires the stack running
+docker compose -f docker/docker-compose.yml up -d postgres redis chromadb
+pytest tests/integration -v
+```
+
+A one-off end-to-end smoke of the graph:
+
+```bash
+python -m scripts.test_graph AAPL "What are the main revenue risks?"
+```
+
+### Offline LLM eval harness
+
+`tests/evals/` is an offline evaluation suite that runs the **real LangGraph pipeline** over a curated dataset and scores the output — the way to catch quality regressions that unit tests can't.
+
+```bash
+# From the project venv (.env is loaded automatically)
+python -m tests.evals.run_evals                       # full dataset
+python -m tests.evals.run_evals --limit 2 --no-llm-judge   # quick smoke, deterministic scorers only
+python -m tests.evals.run_evals --mlflow              # also log the run to MLflow
+```
+
+It scores each row on citation faithfulness, factuality, refusal correctness, and risk-band accuracy. The LLM-as-judge scorer is disk-cached so re-runs are cheap; `--no-llm-judge` skips it entirely. Results are written under `evals/results/`.
+
+With `--mlflow`, each run is also logged to the `finsight-evals` MLflow experiment — params, aggregate metrics, and the result files as artifacts — so quality can be charted across runs (`mlflow ui`) instead of diffing timestamped folders. Tracking is local/file-based by default; set `MLFLOW_TRACKING_URI` to use a server. The flag is off by default and a missing `mlflow` install is a soft skip.
+
+See `docs/evals/README.md` for the dataset format and scorer details.
+
+---
+
+## Troubleshooting
+
+**`openai.AuthenticationError: 401 - You didn't provide an API key`**
+Your `.env` is not being loaded into the `app` container. Confirm the file lives at the project root (not `docker/.env`) and contains `OPENAI_API_KEY=sk-...`. Verify inside the container:
+
+```bash
+docker compose -f docker/docker-compose.yml exec app \
+  python3 -c "import os; print(len(os.environ.get('OPENAI_API_KEY','')))"
+```
+It should print a number > 0.
+
+**`RuntimeError: ... got Future ... attached to a different loop`**
+This happens when the module-level async engine is reused from a worker thread with its own event loop. The Data Agent now builds a local `NullPool` engine per call to avoid it. If you hit it in new code, follow the same pattern: create a fresh `create_async_engine(..., poolclass=NullPool)` inside the coroutine.
+
+**Report completes immediately with "No relevant documents found"**
+Chroma is empty for that ticker. Either run the manual seeding script (`python -m scripts.ingest_ticker AAPL`) or let the Data Agent re-ingest by truncating the `chunks` table:
+
+```bash
+docker compose -f docker/docker-compose.yml exec -T postgres \
+  psql -U finsight -d finsight -c "TRUNCATE chunks;"
+```
+
+Then submit a new analyze request — the Data Agent will re-embed all existing filings.
+
+**Port 3000 already in use**
+Something else is bound to it (often a stray `next dev`). Free it:
+
+```bash
+lsof -ti:3000 | xargs -r kill -9
+```
+
+**Frontend build shows an old `NEXT_PUBLIC_API_URL`**
+Those variables are **inlined at build time** by Next.js. Rebuild the frontend image when you change them:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d --build frontend
+```
+
+**Chat returns empty or no results**
+The ticker's filings haven't been embedded yet. Run an analysis first from the workspace ("Generate report"), which triggers the Data Agent to ingest filings and create embeddings. Chat queries the same vector store.
+
+**Reset everything**
+
+```bash
+docker compose -f docker/docker-compose.yml down -v
+docker compose -f docker/docker-compose.yml up -d --build
+```
+
+---
+
+## Project status
+
+This repo is being built week-by-week from `Docs/project_proposal.md`. Current state:
+
+- **Weeks 1–4** — Data pipelines, DB models, RAG chain, multi-agent graph, FastAPI endpoints, auth, tests. Done.
+- **Week 5** — Docker Compose stack for local dev. Done.
+- **Week 9** — Next.js frontend (dashboard, chat, reports). Done.
+- **Product hardening pass 1** — Intent-aware supervisor + smalltalk agent so greetings no longer trigger the full research pipeline; default SEC form types include 10-Q; scheduler enabled by default. Done.
+- **Product hardening pass 2** — Per-source freshness TTLs in the Data Agent (market 15 min, SEC 24 h); financials upsert instead of no-op; `Filing.content_hash` + `embedded_content_hash` with automatic re-embedding when filings change; legacy backfill for existing rows. Done.
+- **Product hardening pass 3** — Persistent conversations with multi-turn context. `Conversation` + `ConversationTurn` models, CRUD helpers, `/conversations` API endpoints, frontend sidebar with conversation list and history restore, prior turns injected into the RAG chain prompt. Also: code cleanup — extracted shared `content_hash` helper, deduplicated Chroma collection access, eliminated N+1 query in the embedder, optimized legacy backfill to avoid loading full filing text into Python. Done.
+- **Auth + chat separation** — Email/password + Google OAuth authentication. Separated analysis pipeline from chat: `/analyze` runs the full multi-agent pipeline and generates reports; `/conversations/{id}/messages` runs lightweight RAG for quick Q&A without creating reports. Re-analysis support with "overwrite" semantics for existing reports. User isolation across all endpoints. Done.
+- **Enrichment pass 1 — Quick wins** — Added KPI cards (net income, EPS, gross margin), filing timeline with SEC links, report history per ticker. Done.
+- **Enrichment pass 2 — New visualizations** — Revenue vs Net Income trend chart, SMA/Bollinger overlays on candlestick chart, 30-day volatility sparkline, risk score breakdown (4 sub-categories), sector peer comparison table, metrics trend across re-analyses. Done.
+- **Enrichment pass 3 — New data sources** — News sentiment feed (Alpha Vantage → Postgres persistence → frontend card), institutional holders (yfinance live), earnings calendar with EPS beat/miss bars, dividend history with yield/payout ratio. All served via new `/ticker/{symbol}/*` endpoints. Done.
+- **Enrichment pass 4 — Report enhancements** — SWOT analysis (2x2 grid in reports), bull vs bear investment thesis cards, client-side PDF export (html2canvas + jsPDF), stock comparison page (`/compare`) with `POST /analyze/compare` endpoint, metric-by-metric head-to-head table with winner highlighting. Done.
+- **Report page deep enhancement** — 14 improvements to the report detail view: sticky TOC sidebar with anchor links, collapsible sections, live price snapshot strip with 30-day sparkline, executive summary banner, revenue segmentation bars with trend indicators, competitive moat card with rating badge, valuation verdict card, catalysts list with impact-colored icons, management assessment card, market context section (news + peers), follow-up question suggestions, share-as-image (Web Share API), enhanced metric tiles with trend arrows. Six new AI-generated fields added to the RAG schema and prompt (executive summary, catalysts, competitive moat, revenue segments, management assessment, valuation verdict). Done.
+- **International coverage pass** — Multi-source data fallback chain (yfinance → Massive → Twelve Data → EODHD → Tiingo) with automatic exchange-suffix detection so Middle East tickers (Tadawul `.SR`, ADX/DFM `.AE`, EGX `.CA`, QSE `.QA`, Kuwait `.KW`, Bahrain `.BH`) and other international markets resolve without manual configuration. News fallback chain (Alpha Vantage → Massive → EODHD → Tiingo). Source provider is reported back in the ingestion result. Dashboard "Refresh data" button + `POST /ticker/{symbol}/refresh` endpoint for on-demand market/news refresh. localStorage caching for the last comparison view. Progressive-backoff polling. Done.
+- **RAG pipeline overhaul** — Upgraded embeddings to `text-embedding-3-large` (3072 dims). Section-aware filing parser that walks the DOM for SEC Item headers (Item 1, 1A, 7, 7A, 8, …) and emits per-section chunks with `section_name` / `item_number` / `chunk_type` metadata. HTML tables extracted as markdown and embedded as separate `chunk_type="table"` chunks prefixed with their originating section. Switched from character-level to token-level splitting with tiktoken `cl100k_base` (512 tokens, 64 overlap). `max_filings` raised from 5 → 10. Split retrieval strategies: **report mode** (`agents/rag_agent.py`) over-fetches and filters to the latest 10-K + latest 10-Q only with cross-encoder reranking, keeping reports tied to the most current disclosures; **chat mode** (`/conversations/{id}/messages`) retrieves across all filings for historical depth. Both modes use `top_k=16`. Source headers in the LLM context now include section name and `[table]` tag. Done.
+- **Information architecture refactor** — Collapsed the separate `/dashboard`, `/chat`, and `/reports` pages into a single per-ticker **workspace** (`/workspace/{ticker}`) with Overview / Research / Chat tabs driven by a `?tab=` URL param, plus a `/home` launcher + cross-ticker activity feed. Live market data now lives only in Overview, AI reports only in Research — no more duplicated panels across pages. Legacy routes redirect so existing links keep working. Done.
+- **Evaluation harness** — `tests/evals/`: an offline eval suite that runs the real LangGraph pipeline over a curated `dataset.jsonl` and scores each row on citation faithfulness, factuality, refusal correctness, and risk-band accuracy, with an optional disk-cached LLM-as-judge. Surfaces quality regressions unit tests can't. Optional `--mlflow` flag logs each run (params, metrics, artifacts) to an MLflow experiment for cross-run comparison. Done.
+- **Reliability + correctness pass** — `risk_score` made nullable so sparse retrieval surfaces an honest "insufficient data" instead of a fabricated placeholder; tolerant Pydantic validators coerce stray LLM prose in list fields rather than failing the whole report; SEC ingestion lowered to 4 filings and downloads them concurrently with retry/backoff; ChromaDB upserts batched to stay under payload limits; the cross-encoder reranker model cached process-wide instead of reloading per request; reports keyed by question so distinct questions each keep their own report; frontend timestamps parsed as UTC. Done.
+- **Temporal retrieval** — Four-layer defense against dense retrieval picking the wrong fiscal year: SEC `reportDate` captured on `Filing.period_of_report` (new migration); a temporal header (`[NVDA · 10-K · FY2025 · Item 7]`) prepended to every chunk before embedding plus a `fiscal_year` metadata tag; query time-intent extraction (`rag/temporal.py` — explicit years, `FY25`, relative phrases); and a soft ChromaDB `fiscal_year` filter that relaxes to unfiltered when too sparse. Done.
+- **Model standardization** — All LLM calls (intent classification, smalltalk, RAG generation, comparison, eval judge) consolidated on **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`); OpenAI is now used exclusively for embeddings. Done.
+- **Weeks 6–8 (AWS infra, CI/CD, deployment)** — Deferred until the end-to-end product is stable locally.
+
+The AWS deployment, CI/CD, and production hardening sections of the proposal are intentionally **not** covered in this README yet — they will be added when that work begins.
