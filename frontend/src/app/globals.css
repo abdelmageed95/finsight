@@ -1,0 +1,141 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme inline {
+  /* Base surfaces */
+  --color-background: #0a0a0b;
+  --color-surface: #141417;
+  --color-surface-elevated: #1a1a1f;
+  --color-border: #26262a;
+  --color-border-strong: #35353b;
+
+  /* Text */
+  --color-foreground: #e8e8ea;
+  --color-muted: #8a8a93;
+  --color-muted-strong: #a8a8b3;
+
+  /* Brand / state */
+  --color-accent: #10b981;
+  --color-accent-hover: #0ea371;
+  --color-danger: #f43f5e;
+  --color-warning: #f59e0b;
+  --color-info: #60a5fa;
+
+  /* Typography */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+  color: var(--color-foreground);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-background);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+}
+
+@utility bg-grid {
+  background-image:
+    linear-gradient(to right, color-mix(in oklab, var(--color-border) 60%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in oklab, var(--color-border) 60%, transparent) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+@utility bg-hero-vignette {
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 0%, color-mix(in oklab, var(--color-accent) 12%, transparent), transparent 60%),
+    radial-gradient(ellipse 60% 50% at 50% 100%, color-mix(in oklab, #60a5fa 6%, transparent), transparent 70%);
+}
+
+/* ---- Chat markdown prose ---- */
+.prose-chat p { margin-bottom: 0.5em; }
+.prose-chat p:last-child { margin-bottom: 0; }
+.prose-chat ul,
+.prose-chat ol { margin: 0.4em 0; padding-left: 1.4em; }
+.prose-chat li { margin-bottom: 0.15em; }
+.prose-chat li::marker { color: var(--color-muted); }
+.prose-chat strong { color: var(--color-foreground); font-weight: 600; }
+.prose-chat h3 { font-size: 0.875rem; font-weight: 600; margin: 0.75em 0 0.25em; color: var(--color-foreground); }
+.prose-chat h4 { font-size: 0.8125rem; font-weight: 600; margin: 0.5em 0 0.2em; color: var(--color-foreground); }
+.prose-chat code {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  background: var(--color-surface-elevated);
+  padding: 0.125em 0.35em;
+  border-radius: 4px;
+}
+.prose-chat pre {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 0.75em 1em;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.prose-chat pre code { background: none; padding: 0; }
+.prose-chat table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.8125rem;
+}
+.prose-chat th,
+.prose-chat td {
+  border: 1px solid var(--color-border);
+  padding: 0.35em 0.6em;
+  text-align: left;
+}
+.prose-chat th {
+  background: var(--color-surface-elevated);
+  font-weight: 600;
+}
+.prose-chat blockquote {
+  border-left: 3px solid var(--color-accent);
+  padding-left: 0.75em;
+  margin: 0.5em 0;
+  color: var(--color-muted-strong);
+}
+.prose-chat a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+@keyframes caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@utility animate-caret {
+  animation: caret-blink 1s steps(1) infinite;
+}
