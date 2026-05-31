@@ -5,6 +5,22 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/**
+ * Generate a unique id usable as a local React key.
+ *
+ * `crypto.randomUUID()` only exists in a *secure context* (HTTPS or
+ * localhost), so it is `undefined` when the app is served over plain http://
+ * — e.g. behind an HTTP-only ALB in production. Calling it there throws and
+ * breaks the handler. Fall back to a non-cryptographic id (these ids are only
+ * used as ephemeral UI keys, never for anything security-sensitive).
+ */
+export function uid(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function formatCurrency(value: number | null | undefined, digits = 2) {
   if (value == null || Number.isNaN(value)) return "—";
   const abs = Math.abs(value);
