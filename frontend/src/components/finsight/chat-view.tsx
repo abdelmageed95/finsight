@@ -15,7 +15,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { cn, formatRelativeTime } from "@/lib/utils";
+import { cn, formatRelativeTime, uid } from "@/lib/utils";
 import type { ConversationListItem } from "@/lib/schemas";
 import { Button } from "@/components/ui/button";
 
@@ -120,11 +120,11 @@ export function ChatView({ initialTicker, initialQuestion }: ChatViewProps) {
     if (!q || busy || !ticker) return;
 
     const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: uid(),
       role: "user",
       text: q,
     };
-    const asstId = crypto.randomUUID();
+    const asstId = uid();
     const asstMsg: ChatMessage = {
       id: asstId,
       role: "assistant",

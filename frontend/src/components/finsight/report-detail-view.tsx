@@ -203,7 +203,25 @@ export function ReportDetailView({ jobId }: { jobId: string }) {
   }
 
   async function copyLink() {
-    await navigator.clipboard.writeText(window.location.href);
+    const url = window.location.href;
+    // navigator.clipboard only exists in a secure context (HTTPS/localhost),
+    // so it is undefined behind an HTTP-only ALB. Fall back to a hidden
+    // textarea + execCommand("copy") which works over plain http://.
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(url);
+      return;
+    }
+    const ta = document.createElement("textarea");
+    ta.value = url;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+    } finally {
+      document.body.removeChild(ta);
+    }
   }
 
   function downloadJson() {
