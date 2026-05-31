@@ -1,7 +1,16 @@
 #!/bin/bash
-# Bootstrap for the ChromaDB host. Installs Docker, mounts the data EBS
-# volume, and runs the Chroma container persisting to it. Rendered by
-# Terraform (chroma.tf) with $${chroma_image} substituted.
+# Bootstrap for the ChromaDB host. Installs Docker, then installs two systemd
+# units that (1) locate + mount the data EBS volume and (2) run the Chroma
+# container persisting to it. Rendered by Terraform (chroma.tf) with
+# $${chroma_image} substituted.
+#
+# Why systemd units instead of doing the work inline?
+#   user_data runs ONCE, on first boot only. The data volume is a separate
+#   Terraform resource (aws_volume_attachment) whose AttachVolume call can
+#   land *after* this script starts, so an inline mount can lose the race and
+#   leave the host permanently broken (cloud-init never re-runs). By driving
+#   the mount + container from systemd units enabled here, every subsequent
+#   boot re-runs them idempotently — a reboot self-heals a lost attach race.
 set -euxo pipefail
 
 # --- Docker -----------------------------------------------------------------
@@ -9,11 +18,20 @@ dnf update -y
 dnf install -y docker
 systemctl enable --now docker
 
-# --- Locate the data EBS volume --------------------------------------------
-# On Nitro instances the attached volume is the non-root NVMe device; it may
-# take a few seconds to appear after the instance boots.
+# --- Volume-mount helper ----------------------------------------------------
+# Waits up to 300s for the attached data volume to appear, formats it ONLY if
+# it has no filesystem yet (so data survives reboots / instance replacement),
+# and mounts it at /data/chroma. Fails loudly on an empty device instead of
+# running `mkfs ""`.
+cat > /usr/local/bin/chroma-mount.sh <<'MOUNT'
+#!/bin/bash
+set -uo pipefail
+
+# On Nitro instances the attached EBS volume is a non-root NVMe device; it can
+# take a while to appear after boot, especially when Terraform attaches it as
+# a separate step right after the instance is created.
 DEVICE=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   for d in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
     if [ -b "$d" ]; then DEVICE="$d"; break; fi
   done
@@ -21,20 +39,71 @@ for _ in $(seq 1 30); do
   sleep 5
 done
 
-# --- Format (first boot only) + mount --------------------------------------
-# Format only if there is no filesystem yet, so data survives reboots and
-# instance replacement that re-attaches the same volume.
-if ! blkid "$DEVICE"; then
+if [ -z "$DEVICE" ]; then
+  echo "FATAL: data volume did not appear after 300s; refusing to continue" >&2
+  exit 1
+fi
+echo "Using data device: $DEVICE"
+
+# Format only on a truly blank device — never reformat an existing filesystem.
+if ! blkid "$DEVICE" >/dev/null 2>&1; then
+  echo "No filesystem on $DEVICE; creating xfs"
   mkfs -t xfs "$DEVICE"
 fi
-mkdir -p /data/chroma
-grep -q "/data/chroma" /etc/fstab || \
-  echo "$DEVICE /data/chroma xfs defaults,nofail 0 2" >> /etc/fstab
-mount -a
 
-# --- Run ChromaDB -----------------------------------------------------------
-docker run -d --name chroma --restart unless-stopped \
+mkdir -p /data/chroma
+if ! grep -q "/data/chroma" /etc/fstab; then
+  echo "$DEVICE /data/chroma xfs defaults,nofail 0 2" >> /etc/fstab
+fi
+mountpoint -q /data/chroma || mount /data/chroma
+echo "Mounted $DEVICE at /data/chroma"
+MOUNT
+chmod +x /usr/local/bin/chroma-mount.sh
+
+# --- chroma-data.service: mount the volume before Chroma starts -------------
+cat > /etc/systemd/system/chroma-data.service <<'UNIT'
+[Unit]
+Description=Locate and mount the ChromaDB data volume
+Before=chroma.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/chroma-mount.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# --- chroma.service: run the Chroma container -------------------------------
+# Runs in the foreground (no -d) so systemd supervises it directly; Restart
+# brings it back after a crash, and Requires/After guarantee Docker is up and
+# the data volume is mounted first. $${chroma_image} is substituted by
+# Terraform at render time.
+cat > /etc/systemd/system/chroma.service <<'UNIT'
+[Unit]
+Description=ChromaDB vector store
+Requires=docker.service chroma-data.service
+After=docker.service chroma-data.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f chroma
+ExecStart=/usr/bin/docker run --rm --name chroma \
   -p 8000:8000 \
   -v /data/chroma:/chroma/chroma \
   -e IS_PERSISTENT=TRUE \
   ${chroma_image}
+ExecStop=/usr/bin/docker stop chroma
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# --- Enable + start ---------------------------------------------------------
+systemctl daemon-reload
+systemctl enable --now chroma-data.service
+systemctl enable --now chroma.service
