@@ -54,9 +54,9 @@ def _judge_key(claim: str, source: str) -> str:
 JUDGE_SYSTEM_PROMPT = """\
 You are a strict fact-checker. Given a CLAIM and a SOURCE excerpt, decide
 whether the SOURCE supports the CLAIM. Respond with exactly one token:
-SUPPORTED  — the source clearly supports the claim
-PARTIAL    — the source is related but does not fully support the claim
-UNSUPPORTED — the source does not support the claim or contradicts it
+SUPPORTED  - the source clearly supports the claim
+PARTIAL    - the source is related but does not fully support the claim
+UNSUPPORTED - the source does not support the claim or contradicts it
 """
 
 
@@ -72,9 +72,9 @@ def _llm_judge(claim: str, source: str, model: str = "claude-haiku-4-5-20251001"
         from langchain_core.messages import HumanMessage, SystemMessage
 
         llm = ChatAnthropic(
-            model=model,
+            model_name=model,
             temperature=0,
-            max_tokens=8,
+            max_tokens_to_sample=8,
             api_key=os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
         )
         resp = llm.invoke([
@@ -125,7 +125,7 @@ def score_faithfulness(report: dict[str, Any], retrieved_docs: list[dict], use_l
             details.append({"excerpt": "", "verdict": "UNSUPPORTED", "reason": "empty excerpt"})
             continue
 
-        # Cheap substring check first — covers verbatim quotes.
+        # Cheap substring check first - covers verbatim quotes.
         if excerpt.strip() and excerpt.strip()[:80].lower() in joined_chunks.lower():
             counts["SUPPORTED"] += 1
             details.append({"excerpt": excerpt[:120], "verdict": "SUPPORTED", "reason": "substring match"})

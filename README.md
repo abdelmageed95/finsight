@@ -18,6 +18,7 @@ The whole pipeline runs behind a FastAPI backend, with a Next.js finance-termina
 ## Table of contents
 
 - [Architecture at a glance](#architecture-at-a-glance)
+- [Deeper reading](#deeper-reading)
 - [Tech stack](#tech-stack)
 - [Repository layout](#repository-layout)
 - [Prerequisites](#prerequisites)
@@ -99,6 +100,22 @@ An `APScheduler` job (`SCHEDULER_ENABLED=true` by default) also refreshes every 
 
 ---
 
+## Deeper reading
+
+Short, focused guides under `docs/`. Each is independently readable and links to the exact files/lines it describes.
+
+| Topic | Read |
+|---|---|
+| **Architecture — the *why* behind every major choice** (start here if you're reading the codebase for the first time) | [`docs/architecture/README.md`](docs/architecture/README.md) |
+| Pipeline agents — supervisor, data agent, RAG mechanism end-to-end | [`docs/agents/README.md`](docs/agents/README.md) |
+| Postgres (RDS) + ChromaDB — what each stores, why they're split, how they stay in sync | [`docs/databases/README.md`](docs/databases/README.md) |
+| Redis cache — what we cache (just one thing), why it's that narrow, future use cases | [`docs/cache/README.md`](docs/cache/README.md) |
+| AWS ALB + ECS auto-scaling — listener rules, target groups, target-tracking policy | [`docs/alb-autoscaling/README.md`](docs/alb-autoscaling/README.md) |
+| AWS deployment walkthrough — Terraform, CI/CD, OIDC, observability | [`docs/deployment/README.md`](docs/deployment/README.md) |
+| Offline LLM eval harness — dataset format, scorers, MLflow integration | [`docs/evals/README.md`](docs/evals/README.md) |
+
+---
+
 ## Tech stack
 
 **Backend**
@@ -151,6 +168,7 @@ Finsight/
 │   ├── temporal.py        Extracts target fiscal year(s) from a query
 │   └── prompts.py         RAG + comparison system prompts
 ├── pipelines/             market_data, sec_filings, embedder, cleaner, scheduler, hashing
+│   ├── financial_summary.py  Structured multi-year financials block for the RAG prompt
 │   ├── massive.py         Massive (Polygon.io) — OHLCV, profile, financials, news
 │   ├── twelvedata.py      Twelve Data — OHLCV, profile, statistics (Middle East coverage)
 │   ├── eodhd.py           EODHD — OHLCV, fundamentals, quarterly, news (70+ exchanges)
@@ -174,6 +192,14 @@ Finsight/
 │   └── ingest_ticker.py   Manual ingestion of a single ticker
 ├── docker/
 │   └── docker-compose.yml Full local stack
+├── docs/
+│   ├── architecture/README.md       The *why* behind every major design choice (start here)
+│   ├── agents/README.md             Pipeline-agents deep dive (full RAG mechanism)
+│   ├── evals/README.md              Evaluation harness reference
+│   ├── cache/README.md              Redis — what we cache and why it's that narrow
+│   ├── databases/README.md          Postgres + ChromaDB — split, sync, schema
+│   ├── alb-autoscaling/README.md    AWS ALB + ECS auto-scaling deep dive
+│   └── deployment/README.md         End-to-end AWS deployment walkthrough
 ├── Dockerfile             Backend image
 ├── alembic.ini
 ├── requirements.txt
@@ -281,7 +307,7 @@ Every research request runs through the Data Agent, which fetches:
 1. Prices, financials, and quarterly periods — tries yfinance first (with exchange-suffix auto-detection for international tickers), then falls through the provider chain (Massive → Twelve Data → EODHD → Tiingo) until one returns data. The `price_source` / `financials_source` fields in the result record which provider actually served the request.
 2. Recent 10-K **and** 10-Q filings from SEC EDGAR (**latest 4 per company** — most recent 10-K plus the last three 10-Qs). Filings are downloaded concurrently (capped at 4 in-flight) with retry-and-backoff on SEC throttling; already-stored filings are skipped, so history accrues across runs. The SEC `reportDate` (the fiscal period a filing *covers*, distinct from its filing date) is captured and stored on each filing.
 3. News sentiment via the Alpha Vantage → Massive → EODHD → Tiingo fallback chain.
-4. Filings are **section-aware-chunked** (split by SEC Item headers, tables extracted as markdown), **token-chunked** at 512 tokens with 64-token overlap (tiktoken `cl100k_base`), and embedded with `text-embedding-3-large` into ChromaDB. Each chunk is prefixed with a temporal/provenance header (e.g. `[NVDA · 10-K · FY2025 · Item 7]`) and tagged with a `fiscal_year` metadata field — see [Temporal retrieval](#temporal-retrieval-getting-the-right-year) below.
+4. Filings are **section-aware-chunked** (split by SEC Item headers, tables extracted as markdown) using **parent-document chunking**: small ~500-token *child* chunks are embedded for retrieval precision, each linked to a larger ~2000-token *parent* block that is what the LLM actually reads (search precise, read rich). Children are embedded with `text-embedding-3-large` into ChromaDB, prefixed with a temporal/provenance header (e.g. `[NVDA · 10-K · FY2025 · Item 7]`) and tagged with `fiscal_year` + `parent_id` metadata — see [Temporal retrieval](#temporal-retrieval-getting-the-right-year) below. Retrieval is **hybrid** (dense vector search ⊕ BM25 keyword search, fused by Reciprocal Rank Fusion) and reranked by a cross-encoder; the full mechanism is documented in [`docs/agents/README.md`](docs/agents/README.md).
 
 First-time ingestion for a new ticker takes ~30–60 seconds. On subsequent requests, the agent consults the cache (see below) and skips whatever is still fresh — repeat queries on the same ticker complete in ~6–10 seconds.
 
@@ -336,6 +362,14 @@ Dense embeddings encode *topic*, not discrete facts: "2024" and "2025" produce n
 4. **Soft metadata filter** — when the query targets specific year(s), retrieval applies a hard ChromaDB `fiscal_year` filter so a wrong-year chunk simply isn't in the candidate set. If the filter returns too few chunks (missing/legacy metadata), it **relaxes to an unfiltered search** so a question is never starved of context.
 
 Because the `fiscal_year` tag lives in chunk metadata, filings embedded before this feature shipped won't match a year filter — the soft fallback keeps them usable, and re-embedding (or a fresh ingest) populates the tag.
+
+### Structured financials in the report
+
+The RAG report is grounded in filing **text** — but numbers parsed from prose, or stranded in a table chunk that didn't survive retrieval, are unreliable. So the analyst is also handed a **structured financial-history block**, separately from the retrieved excerpts.
+
+The Data Agent builds it from the `financials` and `prices` tables (`pipelines/financial_summary.py` · `build_financial_context`): a compact markdown table of revenue, net income, EPS, and gross margin for the **last ~5 fiscal years and ~4 quarters**, plus a short price snapshot. It flows through graph state (`financial_context`) into the RAG prompt under a dedicated `## Historical Financials` heading, and the prompt instructs the LLM to treat it as the **authoritative source** for quantitative figures and year-over-year trends — the filing excerpts supply the narrative, segment, and risk detail the table cannot.
+
+The block is ~300 tokens, budgeted separately from the retrieved-chunk context, so it costs nothing meaningful. The result: the model sees a company's full multi-year trajectory, not just whatever figures happened to land in the latest 10-K's retrieved chunks.
 
 ### Handling greetings and smalltalk
 

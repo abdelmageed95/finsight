@@ -156,6 +156,39 @@ class VectorStore:
         )
         return docs
 
+    def get_ticker_documents(
+        self,
+        ticker: str | None = None,
+        doc_types: list[str] | None = None,
+        fiscal_years: list[int] | None = None,
+    ) -> list[dict]:
+        """Fetch every stored chunk matching the filters — no vector search.
+
+        Used to build the in-memory BM25 keyword index for hybrid retrieval,
+        which needs the full candidate corpus rather than a top-k slice.
+
+        Returns:
+            List of dicts with keys: id, text, metadata.
+        """
+        where_filter = self._build_where_filter(ticker, doc_types, fiscal_years)
+        got = self._collection.get(
+            where=where_filter,
+            include=["documents", "metadatas"],
+        )
+        ids = got.get("ids") or []
+        documents = got.get("documents") or []
+        metadatas = got.get("metadatas") or []
+        docs = [
+            {
+                "id": ids[i],
+                "text": documents[i] if i < len(documents) else "",
+                "metadata": metadatas[i] if i < len(metadatas) else {},
+            }
+            for i in range(len(ids))
+        ]
+        logger.info("get_ticker_documents: %d chunks (ticker=%s)", len(docs), ticker)
+        return docs
+
     def _build_where_filter(
         self,
         ticker: str | None,

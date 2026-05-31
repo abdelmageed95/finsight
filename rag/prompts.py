@@ -92,6 +92,18 @@ do not contain enough data to populate one, return an empty array `[]` — NEVER
 sentence explaining why. Do not write "The retrieved sources are insufficient..." \
 into an array field; just return `[]`.
 
+16. **Historical financials.** A structured multi-year financial table is \
+provided below under "Historical Financials" — revenue, net income, EPS, and \
+margins by period, sourced from market data. Treat it as the AUTHORITATIVE \
+source for quantitative figures and year-over-year trends; prefer it over \
+numbers parsed from filing prose. Use it to populate `key_metrics` and to \
+judge revenue/margin trajectory and growth. The filing excerpts below supply \
+the narrative, qualitative, segment, and risk detail the table cannot.
+
+## Historical Financials
+
+{financial_context}
+
 ## Retrieved Sources
 
 {context}

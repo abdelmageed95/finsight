@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 
 import chromadb
@@ -26,13 +27,36 @@ from pipelines.hashing import content_hash
 
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 512       # tokens (not characters)
-CHUNK_OVERLAP = 64     # tokens
+# Parent-document chunking. We embed *small* child chunks for retrieval
+# precision (a tight chunk → a sharp, un-blurred embedding), but feed the
+# LLM the *parent* block the child came from, so it sees full surrounding
+# context instead of a 500-token sliver. See chunk_filing().
+CHILD_CHUNK_SIZE = 500      # tokens — embedded + retrieved + reranked
+CHILD_CHUNK_OVERLAP = 80    # tokens
+PARENT_CHUNK_SIZE = 2000    # tokens — the block handed to the LLM
+PARENT_CHUNK_OVERLAP = 200  # tokens
+
+# Back-compat aliases (legacy callers / tests reference these names).
+CHUNK_SIZE = CHILD_CHUNK_SIZE
+CHUNK_OVERLAP = CHILD_CHUNK_OVERLAP
+
 EMBEDDING_MODEL = "text-embedding-3-large"
 COLLECTION_NAME = "finsight_filings"
 
-# tiktoken encoder for OpenAI models (cl100k_base covers gpt-5-nano, embeddings-3)
+# tiktoken encoder for OpenAI models (cl100k_base covers text-embedding-3)
 _encoding = tiktoken.get_encoding("cl100k_base")
+
+# OpenAI's embeddings endpoint rejects any request over 300,000 tokens or
+# 2,048 inputs. A full 10-K's worth of chunks blows past the token cap, so
+# embed_texts() splits into sub-requests below these limits.
+#
+# The token budget is deliberately well under 300k: the API's own token
+# accounting runs noticeably higher than a local tiktoken cl100k_base count
+# (observed ~1.25x on table-heavy filings — a batch measured at 243k tokens
+# was billed as 305k and rejected). 150k gives ~2x headroom over that gap,
+# at the cost of a few more requests per filing — embeddings calls are cheap.
+_MAX_TOKENS_PER_REQUEST = 150_000
+_MAX_INPUTS_PER_REQUEST = 2_048
 
 
 def _token_len(text: str) -> int:
@@ -40,22 +64,41 @@ def _token_len(text: str) -> int:
     return len(_encoding.encode(text))
 
 
-# Splitter configured for token-level chunking
-_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP,
+# Token-level splitters. The same separator ladder is used for both
+# granularities; only the target size differs.
+_SEPARATORS = ["\n\n", "\n", ". ", " "]
+
+_child_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHILD_CHUNK_SIZE,
+    chunk_overlap=CHILD_CHUNK_OVERLAP,
     length_function=_token_len,
-    separators=["\n\n", "\n", ". ", " "],
+    separators=_SEPARATORS,
 )
+_parent_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=PARENT_CHUNK_SIZE,
+    chunk_overlap=PARENT_CHUNK_OVERLAP,
+    length_function=_token_len,
+    separators=_SEPARATORS,
+)
+# Back-compat alias.
+_splitter = _child_splitter
 
 
 @dataclass
 class PreparedChunk:
-    """A chunk ready for embedding, with metadata."""
+    """A child chunk ready for embedding, with parent-document metadata.
+
+    `text` is the small chunk that gets embedded and retrieved; `parent_text`
+    is the larger block it belongs to, which is what the LLM actually reads.
+    `parent_id` groups all children of the same parent so retrieval can
+    de-duplicate and expand a hit to its parent.
+    """
     text: str
     chunk_type: str       # "prose" or "table"
     section_name: str     # e.g. "Risk Factors", "MD&A", "full_text"
     item_number: str      # e.g. "1A", "7", ""
+    parent_id: str        # shared by all children of one parent block
+    parent_text: str      # the parent block — fed to the LLM as context
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +127,40 @@ def _get_collection(chroma: chromadb.ClientAPI) -> chromadb.Collection:
 # ---------------------------------------------------------------------------
 
 def chunk_text(text: str) -> list[str]:
-    """Split text into ~512-token chunks. Legacy API for backward compat."""
-    return _splitter.split_text(text)
+    """Split text into child-sized chunks. Legacy API for backward compat."""
+    return _child_splitter.split_text(text)
+
+
+def _add_parent_child(
+    chunks: list[PreparedChunk],
+    text: str,
+    chunk_type: str,
+    section_name: str,
+    item_number: str,
+) -> None:
+    """Split `text` into parent blocks, then each parent into child chunks.
+
+    Every child carries its parent's id and full text, so a retrieval hit on
+    a small child can be expanded to the larger, more readable parent block.
+    """
+    for parent_block in _parent_splitter.split_text(text):
+        parent_id = uuid.uuid4().hex
+        for child in _child_splitter.split_text(parent_block):
+            chunks.append(PreparedChunk(
+                text=child,
+                chunk_type=chunk_type,
+                section_name=section_name,
+                item_number=item_number,
+                parent_id=parent_id,
+                parent_text=parent_block,
+            ))
 
 
 def chunk_filing(raw_html: str) -> list[PreparedChunk]:
-    """Parse a filing into section-aware, token-level chunks with tables.
+    """Parse a filing into section-aware parent/child chunks with tables.
 
-    Returns a list of PreparedChunk with metadata for each chunk.
+    Returns a flat list of child PreparedChunks; each one references the
+    parent block it belongs to (see _add_parent_child / PreparedChunk).
     """
     from pipelines.cleaner import parse_filing_sections
 
@@ -102,53 +171,31 @@ def chunk_filing(raw_html: str) -> list[PreparedChunk]:
     if parsed.sections:
         # Section-aware chunking
         for section in parsed.sections:
-            # Chunk prose within this section
             if section.text and _token_len(section.text) > 10:
-                text_chunks = _splitter.split_text(section.text)
-                for tc in text_chunks:
-                    chunks.append(PreparedChunk(
-                        text=tc,
-                        chunk_type="prose",
-                        section_name=section.section_name,
-                        item_number=section.item_number,
-                    ))
-
-            # Each table is its own chunk (prefixed with section context)
+                _add_parent_child(
+                    chunks, section.text, "prose",
+                    section.section_name, section.item_number,
+                )
+            # Each table is prefixed with section context, then parent/child
+            # split like prose (a small table collapses to a single chunk
+            # whose child == parent).
             for table_md in section.tables:
                 if _token_len(table_md) < 10:
                     continue
-                # If table is too large, split it too
-                if _token_len(table_md) > CHUNK_SIZE * 2:
-                    table_chunks = _splitter.split_text(table_md)
-                    for tc in table_chunks:
-                        chunks.append(PreparedChunk(
-                            text=f"[Table from {section.section_name}]\n{tc}",
-                            chunk_type="table",
-                            section_name=section.section_name,
-                            item_number=section.item_number,
-                        ))
-                else:
-                    chunks.append(PreparedChunk(
-                        text=f"[Table from {section.section_name}]\n{table_md}",
-                        chunk_type="table",
-                        section_name=section.section_name,
-                        item_number=section.item_number,
-                    ))
+                _add_parent_child(
+                    chunks, f"[Table from {section.section_name}]\n{table_md}",
+                    "table", section.section_name, section.item_number,
+                )
     else:
         # Fallback: flat text chunking (non-SEC docs or parsing failure)
         if parsed.full_text and _token_len(parsed.full_text) > 10:
-            text_chunks = _splitter.split_text(parsed.full_text)
-            for tc in text_chunks:
-                chunks.append(PreparedChunk(
-                    text=tc,
-                    chunk_type="prose",
-                    section_name="full_text",
-                    item_number="",
-                ))
+            _add_parent_child(chunks, parsed.full_text, "prose", "full_text", "")
 
+    n_parents = len({c.parent_id for c in chunks})
     logger.info(
-        "Chunked filing: %d total chunks (%d prose, %d tables, %d sections)",
-        len(chunks),
+        "Chunked filing: %d child chunks across %d parents "
+        "(%d prose, %d table, %d sections)",
+        len(chunks), n_parents,
         sum(1 for c in chunks if c.chunk_type == "prose"),
         sum(1 for c in chunks if c.chunk_type == "table"),
         len(parsed.sections),
@@ -161,12 +208,44 @@ def chunk_filing(raw_html: str) -> list[PreparedChunk]:
 # ---------------------------------------------------------------------------
 
 def embed_texts(texts: list[str], client: OpenAI | None = None) -> list[list[float]]:
-    """Embed a batch of texts using OpenAI text-embedding-3-large."""
+    """Embed texts using OpenAI text-embedding-3-large.
+
+    Splits into sub-requests so no single call exceeds OpenAI's per-request
+    limits (300k tokens / 2048 inputs). Embeddings are returned in the same
+    order as the input texts.
+    """
     if not texts:
         return []
     client = client or _get_openai_client()
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-    return [item.embedding for item in response.data]
+
+    embeddings: list[list[float]] = []
+    batch: list[str] = []
+    batch_tokens = 0
+
+    def _flush() -> None:
+        nonlocal batch, batch_tokens
+        if not batch:
+            return
+        response = client.embeddings.create(model=EMBEDDING_MODEL, input=batch)
+        embeddings.extend(item.embedding for item in response.data)
+        batch, batch_tokens = [], 0
+
+    for text in texts:
+        n_tokens = _token_len(text)
+        # Close the current batch before it would exceed either limit. A
+        # single oversized chunk (> the token cap on its own) still gets
+        # sent solo — chunking upstream keeps texts well under 512 tokens,
+        # so this is a guard, not an expected path.
+        if batch and (
+            batch_tokens + n_tokens > _MAX_TOKENS_PER_REQUEST
+            or len(batch) >= _MAX_INPUTS_PER_REQUEST
+        ):
+            _flush()
+        batch.append(text)
+        batch_tokens += n_tokens
+
+    _flush()
+    return embeddings
 
 
 def _fiscal_year(filing: Filing) -> int:
@@ -290,6 +369,10 @@ async def embed_filing(
                 "section_name": chunk.section_name,
                 "item_number": chunk.item_number,
                 "chunk_type": chunk.chunk_type,
+                # Parent-document retrieval: parent_id de-dupes/groups hits,
+                # parent_text is the larger block handed to the LLM.
+                "parent_id": chunk.parent_id,
+                "parent_text": chunk.parent_text,
             })
 
         # Sub-batch the upsert so payload stays bounded regardless of

@@ -45,7 +45,13 @@ def _get_cross_encoder(model_name: str):
                 "Install with: pip install sentence-transformers"
             )
             raise
-        model = CrossEncoder(model_name)
+        # trust_remote_code lets newer rerankers (e.g. the GTE ModernBERT
+        # cross-encoder) load their custom code; harmless for plain models.
+        try:
+            model = CrossEncoder(model_name, trust_remote_code=True)
+        except TypeError:
+            # Older sentence-transformers without the kwarg.
+            model = CrossEncoder(model_name)
         _MODEL_CACHE[model_name] = model
         logger.info("Loaded cross-encoder model: %s (cached for process)", model_name)
         return model
@@ -54,10 +60,14 @@ def _get_cross_encoder(model_name: str):
 class CrossEncoderReranker:
     """Reranks retrieved chunks using a cross-encoder model from sentence-transformers."""
 
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2", top_n: int = 4):
+    DEFAULT_MODEL = "Alibaba-NLP/gte-reranker-modernbert-base"
+
+    def __init__(self, model_name: str = DEFAULT_MODEL, top_n: int = 4):
         """
         Args:
-            model_name: HuggingFace cross-encoder model to use.
+            model_name: HuggingFace cross-encoder model to use. Defaults to
+                the GTE ModernBERT reranker — an 8192-token-context model,
+                so it scores big parent-sized chunks without truncation.
             top_n: Number of top chunks to return after reranking.
         """
         self._model_name = model_name

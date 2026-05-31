@@ -113,11 +113,16 @@ def data_agent_node(state: "GraphState") -> Command[Literal["supervisor"]]:
         bits.append("data already fresh — using cache")
     _progress(state, "Data ready: " + ", ".join(bits) + ".", 35)
 
+    # Lift the financial-history block out to a top-level state field so the
+    # RAG agent can read it directly (and it doesn't bloat tool_results).
+    financial_context = results.pop("financial_context", "")
+
     return Command(
         goto="supervisor",
         update={
             "messages": [AIMessage(content=summary, name="data_agent")],
             "tool_results": {"data_agent": results},
+            "financial_context": financial_context,
         },
     )
 
@@ -201,6 +206,17 @@ async def _fetch_all(ticker: str) -> dict:
             logger.exception("Data agent: embedding failed for %s", ticker)
             errors.append(f"embedder: {e}")
 
+        # Build the structured financial-history block from the stored
+        # financials/prices tables — fed to the RAG prompt so the analyst
+        # has authoritative multi-year numbers, not just filing text.
+        financial_context = ""
+        try:
+            from pipelines.financial_summary import build_financial_context
+            financial_context = await build_financial_context(session, ticker)
+        except Exception as e:
+            logger.exception("Data agent: financial summary failed for %s", ticker)
+            errors.append(f"financial_summary: {e}")
+
     await local_engine.dispose()
 
     return {
@@ -208,5 +224,6 @@ async def _fetch_all(ticker: str) -> dict:
         "sec": sec_result,
         "news": news_result,
         "embed": embed_result,
+        "financial_context": financial_context,
         "errors": errors,
     }

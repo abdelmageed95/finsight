@@ -13,7 +13,7 @@ interface Article {
   published_at: string | null;
   summary: string;
   sentiment_score: number | null;
-  sentiment_label: string;
+  sentiment_label: string | null;
 }
 
 interface NewsResponse {
@@ -21,12 +21,13 @@ interface NewsResponse {
   articles: Article[];
 }
 
-function sentimentColor(score: number | null, label: string): string {
+function sentimentColor(score: number | null, label: string | null): string {
   if (score != null) {
     if (score > 0.15) return "var(--color-accent)";
     if (score < -0.15) return "var(--color-danger)";
     return "var(--color-muted)";
   }
+  if (!label) return "var(--color-muted)";
   const l = label.toLowerCase();
   if (l.includes("bull") || l.includes("positive")) return "var(--color-accent)";
   if (l.includes("bear") || l.includes("negative")) return "var(--color-danger)";

@@ -534,6 +534,7 @@ export function ReportDetailView({ jobId }: { jobId: string }) {
                     <div className="space-y-3">
                       {data.revenue_segments.map((seg, i) => {
                         const trendColor = seg.trend === "growing" ? "var(--color-accent)" : seg.trend === "declining" ? "var(--color-danger)" : "var(--color-muted)";
+                        const pct = seg.percentage;
                         return (
                           <div key={i}>
                             <div className="mb-1 flex items-center justify-between text-sm">
@@ -545,16 +546,16 @@ export function ReportDetailView({ jobId }: { jobId: string }) {
                               </div>
                               <div className="flex items-center gap-3">
                                 <span className="font-mono text-xs tabular-nums text-[var(--color-muted-strong)]">{seg.value}</span>
-                                <span className="font-mono text-xs tabular-nums text-[var(--color-foreground)] font-medium w-12 text-right">{seg.percentage.toFixed(1)}%</span>
+                                <span className="font-mono text-xs tabular-nums text-[var(--color-foreground)] font-medium w-12 text-right">{pct != null ? `${pct.toFixed(1)}%` : "—"}</span>
                               </div>
                             </div>
                             <div className="h-2.5 w-full rounded-full bg-[var(--color-surface)]">
                               <div
                                 className="h-full rounded-full transition-all"
                                 style={{
-                                  width: `${Math.min(seg.percentage, 100)}%`,
+                                  width: `${Math.min(pct ?? 0, 100)}%`,
                                   backgroundColor: "var(--color-accent)",
-                                  opacity: 0.4 + (seg.percentage / 100) * 0.6,
+                                  opacity: 0.4 + ((pct ?? 0) / 100) * 0.6,
                                 }}
                               />
                             </div>

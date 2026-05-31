@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored —
+# never commit real secrets.
+
+# --- Required: secrets ------------------------------------------------------
+db_password    = "change-me-strong-password"
+claude_api_key = "sk-ant-..."
+openai_api_key = "sk-..."
+jwt_secret_key = "change-me-long-random-string"
+
+# --- Required: CI/CD --------------------------------------------------------
+# Your GitHub repository as owner/repo — scopes the OIDC deploy role.
+github_repo = "your-github-username/finsight"
+
+# --- Optional ---------------------------------------------------------------
+alpha_vantage_api_key = ""          # news sentiment; blank disables it
+
+# Fallback market-data providers. yfinance (no key) is the primary source;
+# these extend coverage to international / Middle East tickers. Blank = off.
+massive_api_key    = ""
+twelvedata_api_key = ""
+eodhd_api_key      = ""
+tiingo_api_key     = ""
+
+alarm_email = ""                    # CloudWatch alarm emails; blank = off
+# aws_region          = "eu-central-1"
+# environment         = "prod"
+# db_instance_class   = "db.t3.micro"
+# redis_node_type     = "cache.t3.micro"
+# chroma_instance_type = "t3.small"
