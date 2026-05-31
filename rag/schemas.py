@@ -44,8 +44,30 @@ class RevenueSegment(BaseModel):
 
     name: str = Field(description="Segment name, e.g. 'iPhone', 'Cloud Services', 'North America'")
     value: str = Field(description="Revenue value with units, e.g. '$69.7B'")
-    percentage: float = Field(ge=0, le=100, description="Percentage of total revenue")
+    percentage: float | None = Field(
+        default=None, ge=0, le=100,
+        description="Percentage of total revenue, or null if the filing does not state it",
+    )
     trend: str = Field(default="unknown", description="Direction: 'growing', 'declining', 'stable', or 'unknown'")
+
+    @field_validator("percentage", mode="before")
+    @classmethod
+    def _coerce_percentage(cls, v: object) -> float | None:
+        """Tolerate the LLM emitting a non-numeric percentage.
+
+        When a filing doesn't break out a segment's share, the model writes
+        things like '<UNKNOWN>', 'N/A', or '27%'. Strip a trailing '%' and
+        parse; anything unparseable becomes None rather than failing the
+        whole report's validation.
+        """
+        if v is None or isinstance(v, (int, float)):
+            return v
+        if isinstance(v, str):
+            try:
+                return float(v.strip().rstrip("%").strip())
+            except ValueError:
+                return None
+        return None
 
 
 class Catalyst(BaseModel):

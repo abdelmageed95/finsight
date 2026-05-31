@@ -109,11 +109,16 @@ def run_one(row: dict, thread_prefix: str) -> tuple[dict, list[dict], float]:
     if "intent" not in final_report and result.get("intent"):
         final_report["intent"] = result["intent"]
 
-    return (
-        final_report,
-        result.get("retrieved_docs", []) or [],
-        latency,
-    )
+    # Faithfulness checks citations against the sources the LLM actually saw.
+    # The structured financial-history block is one of those sources, so
+    # append it to the pool — otherwise a citation grounded in the financials
+    # table is wrongly scored UNSUPPORTED.
+    retrieved_docs = list(result.get("retrieved_docs", []) or [])
+    financial_context = result.get("financial_context") or ""
+    if financial_context:
+        retrieved_docs.append({"doc_type": "financials", "text": financial_context})
+
+    return (final_report, retrieved_docs, latency)
 
 
 # Per-row scoring
@@ -298,6 +303,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Also log this run (params, metrics, artifacts) to MLflow. Off by default.",
     )
+    parser.add_argument(
+        "--row-delay",
+        type=float,
+        default=0.0,
+        help="Seconds to pause between rows. Use it to stay under a low "
+             "per-minute API rate limit (e.g. --row-delay 60).",
+    )
     args = parser.parse_args(argv)
 
     dataset_path = Path(args.dataset)
@@ -348,6 +360,10 @@ def main(argv: list[str] | None = None) -> int:
             "scores": scores,
             "error": err,
         })
+
+        # Pace rows to stay under a low per-minute API rate limit.
+        if args.row_delay and i < len(rows):
+            time.sleep(args.row_delay)
 
     summary = aggregate(per_row_scores)
     write_results(out_dir, per_row_scores, summary, meta)

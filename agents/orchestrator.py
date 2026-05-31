@@ -68,6 +68,8 @@ class GraphState(TypedDict, total=False):
     - question:       The user's natural-language question.
     - intent:         Classified intent of the user message (set by supervisor).
     - prior_turns:    Previous conversation turns for multi-turn context.
+    - financial_context: Structured multi-year financials block (set by the
+                      data agent, read by the RAG agent).
     - retrieved_docs: Document chunks retrieved by the RAG agent (appended).
     - tool_results:   Results from each agent, keyed by agent name (merged).
     - final_report:   The completed research report (merged).
@@ -79,6 +81,7 @@ class GraphState(TypedDict, total=False):
     intent: str
     job_id: str
     prior_turns: list[dict]
+    financial_context: str
     retrieved_docs: Annotated[list[dict], extend_list]
     tool_results: Annotated[dict[str, Any], merge_dicts]
     final_report: Annotated[dict[str, Any], merge_dicts]

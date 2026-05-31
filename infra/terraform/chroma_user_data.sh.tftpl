@@ -1,0 +1,40 @@
+#!/bin/bash
+# Bootstrap for the ChromaDB host. Installs Docker, mounts the data EBS
+# volume, and runs the Chroma container persisting to it. Rendered by
+# Terraform (chroma.tf) with $${chroma_image} substituted.
+set -euxo pipefail
+
+# --- Docker -----------------------------------------------------------------
+dnf update -y
+dnf install -y docker
+systemctl enable --now docker
+
+# --- Locate the data EBS volume --------------------------------------------
+# On Nitro instances the attached volume is the non-root NVMe device; it may
+# take a few seconds to appear after the instance boots.
+DEVICE=""
+for _ in $(seq 1 30); do
+  for d in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
+    if [ -b "$d" ]; then DEVICE="$d"; break; fi
+  done
+  [ -n "$DEVICE" ] && break
+  sleep 5
+done
+
+# --- Format (first boot only) + mount --------------------------------------
+# Format only if there is no filesystem yet, so data survives reboots and
+# instance replacement that re-attaches the same volume.
+if ! blkid "$DEVICE"; then
+  mkfs -t xfs "$DEVICE"
+fi
+mkdir -p /data/chroma
+grep -q "/data/chroma" /etc/fstab || \
+  echo "$DEVICE /data/chroma xfs defaults,nofail 0 2" >> /etc/fstab
+mount -a
+
+# --- Run ChromaDB -----------------------------------------------------------
+docker run -d --name chroma --restart unless-stopped \
+  -p 8000:8000 \
+  -v /data/chroma:/chroma/chroma \
+  -e IS_PERSISTENT=TRUE \
+  ${chroma_image}

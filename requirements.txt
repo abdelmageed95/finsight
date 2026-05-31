@@ -35,6 +35,7 @@ apscheduler>=3.10.0
 langchain-text-splitters>=0.3.0
 tiktoken>=0.7.0
 sentence-transformers>=5.4.1
+rank-bm25>=0.2.2  # BM25 lexical retriever for hybrid search
 
 # Logging
 structlog>=24.1.0

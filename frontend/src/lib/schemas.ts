@@ -69,7 +69,7 @@ export const reportResponseSchema = z.object({
   revenue_segments: z.array(z.object({
     name: z.string(),
     value: z.string(),
-    percentage: z.number(),
+    percentage: z.number().nullable(),
     trend: z.string().optional(),
   })).nullable().optional(),
   management_assessment: z.string().nullable().optional(),

@@ -32,9 +32,10 @@ def main():
     print("=" * 60)
     print("Running RAG chain...\n")
 
-    report = chain.invoke(ticker, question)
+    report, chunks = chain.invoke(ticker, question)
 
     print("=" * 60)
+    print(f"RETRIEVED CHUNKS: {len(chunks)}")
     print(f"TICKER: {report.ticker}")
     print(f"RISK SCORE: {report.risk_score}/100")
     print(f"RISK RATIONALE: {report.risk_rationale}")

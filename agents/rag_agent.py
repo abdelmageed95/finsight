@@ -57,7 +57,11 @@ def rag_agent_node(state: "GraphState") -> Command[Literal["supervisor"]]:
 
     chain = create_rag_chain(use_reranker=True, top_k=16, rerank_top_n=8, mode="report")
     _progress(state, "Generating risk analysis with Claude Haiku…", 65, stage="report")
-    report = chain.invoke(ticker, question, prior_turns=prior_turns)
+    report, source_chunks = chain.invoke(
+        ticker, question,
+        prior_turns=prior_turns,
+        financial_context=state.get("financial_context", ""),
+    )
 
     # Hard guard: if the model produced a report with too few citations,
     # we cannot trust the risk_score. Force it to null and flip confidence
@@ -87,14 +91,21 @@ def rag_agent_node(state: "GraphState") -> Command[Literal["supervisor"]]:
         f"{report.summary}"
     )
 
-    # Store retrieved doc references
-    retrieved_docs = []
-    for citation in report.citations:
-        retrieved_docs.append({
-            "source_index": citation.source_index,
-            "doc_type": citation.doc_type,
-            "excerpt": citation.excerpt,
-        })
+    # Store the reranked source chunks the LLM actually saw. This is the
+    # raw filing text — not the LLM's citation excerpts — so downstream
+    # consumers (the eval harness' faithfulness scorer, provenance views)
+    # can verify citations against the real source.
+    retrieved_docs = [
+        {
+            "doc_type": c.doc_type,
+            "text": c.text,
+            "fiscal_year": c.fiscal_year,
+            "source_url": c.source_url,
+            "accession_number": c.accession_number,
+            "section_name": c.section_name,
+        }
+        for c in source_chunks
+    ]
 
     logger.info(
         "RAG agent complete: risk_score=%s confidence=%s citations=%d",

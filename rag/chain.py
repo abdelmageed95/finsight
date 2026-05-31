@@ -4,7 +4,7 @@ Usage:
     from rag.chain import create_rag_chain
 
     chain = create_rag_chain()
-    report = chain.invoke("AAPL", "What are AAPL's main revenue risks?")
+    report, chunks = chain.invoke("AAPL", "What are AAPL's main revenue risks?")
     print(report.summary)
     print(report.risk_score)
 """
@@ -25,8 +25,11 @@ from rag.prompts import (
 )
 from rag.reranker import CrossEncoderReranker, NoOpReranker
 from rag.retriever import (
-    Retriever,
+    HybridRetriever,
+    RetrievedChunk,
     RetrieverConfig,
+    cap_context_tokens,
+    expand_to_parents,
     filter_to_latest_filings,
     format_chunks_as_context,
 )
@@ -41,6 +44,11 @@ logger = logging.getLogger(__name__)
 # filter is too sparse (missing/legacy metadata) we relax to an unfiltered
 # search and let the reranker sort it out.
 MIN_TEMPORAL_CHUNKS = 4
+
+# Upper bound on the parent-block context fed to the LLM, in tokens. Parent
+# blocks are large (~2k tokens each); without a cap a handful of them can
+# exceed model input limits, balloon cost, and dilute the answer.
+MAX_CONTEXT_TOKENS = 5000
 
 
 class RAGChain:
@@ -63,7 +71,7 @@ class RAGChain:
         rerank_top_n: int = 4,
         mode: str = "report",
     ):
-        self._retriever = Retriever(vector_store, config=retriever_config)
+        self._retriever = HybridRetriever(vector_store, config=retriever_config)
         self._mode = mode
 
         if use_reranker:
@@ -76,6 +84,9 @@ class RAGChain:
             temperature=0,
             max_tokens=4096,
             api_key=os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
+            # Ride out transient 429s — LangChain honours the retry-after
+            # header, so bursts against a low per-minute limit self-heal.
+            max_retries=8,
         )
         self._structured_llm = self._llm.with_structured_output(ReportSchema)
 
@@ -86,7 +97,8 @@ class RAGChain:
         doc_types: list[str] | None = None,
         top_k: int = 8,
         prior_turns: list[dict] | None = None,
-    ) -> ReportSchema:
+        financial_context: str = "",
+    ) -> tuple[ReportSchema, list[RetrievedChunk]]:
         """Run the full RAG pipeline and return a structured report.
 
         Args:
@@ -95,9 +107,16 @@ class RAGChain:
             doc_types: Filing types to search (default: ["10-K", "10-Q"]).
             top_k: Number of chunks to retrieve before reranking.
             prior_turns: Previous conversation turns for multi-turn context.
+            financial_context: Pre-formatted structured financial-history
+                block (see pipelines.financial_summary). Injected into the
+                prompt so the LLM has authoritative multi-year numbers, not
+                just figures parsed from retrieved filing text.
 
         Returns:
-            ReportSchema with summary, risk_score, citations, etc.
+            (report, chunks) — the ReportSchema (summary, risk_score,
+            citations, …) plus the reranked source chunks the LLM saw.
+            The chunks let callers verify citation provenance; the list is
+            empty when no documents were retrieved.
         """
         logger.info("RAG chain invoked: ticker=%s mode=%s question='%s'", ticker, self._mode, question[:80])
 
@@ -141,22 +160,32 @@ class RAGChain:
                 key_metrics=[],
                 citations=[],
                 confidence="low",
-            )
+            ), []
 
         # Step 1b: Report mode — restrict to latest filing per doc_type
         if self._mode == "report":
             chunks = filter_to_latest_filings(chunks)
-            # Trim back to top_k after filtering
-            chunks = chunks[:top_k]
 
-        # Step 2: Rerank
+        # Step 2: Rerank the child chunks — precise scoring on small text.
         reranked = self._reranker.rerank(question, chunks)
 
-        # Step 3: Format context
-        context = format_chunks_as_context(reranked)
+        # Step 3: Parent-document expansion — swap each top child for its
+        # larger parent block so the LLM reads full context, not a sliver —
+        # then cap the total so the prompt stays within model input limits.
+        parents = expand_to_parents(reranked)
+        parents = cap_context_tokens(parents, MAX_CONTEXT_TOKENS)
 
-        # Step 4: Build messages
-        system_message = RAG_SYSTEM_PROMPT.format(context=context)
+        # Step 4: Format context
+        context = format_chunks_as_context(parents)
+
+        # Step 5: Build messages
+        system_message = RAG_SYSTEM_PROMPT.format(
+            context=context,
+            financial_context=(
+                financial_context
+                or "No structured financial data available — rely on the filing excerpts below."
+            ),
+        )
         user_message = RAG_USER_PROMPT.format(ticker=ticker.upper(), question=question)
 
         messages = [
@@ -170,8 +199,11 @@ class RAGChain:
 
         messages.append({"role": "user", "content": user_message})
 
-        # Step 5: LLM call with structured output
-        logger.info("Calling LLM with %d context chunks, %d prior turns", len(reranked), len(prior_turns or []))
+        # Step 6: LLM call with structured output
+        logger.info(
+            "Calling LLM with %d parent blocks (%d child hits), %d prior turns",
+            len(parents), len(reranked), len(prior_turns or []),
+        )
         report = self._structured_llm.invoke(messages)
 
         logger.info(
@@ -179,7 +211,9 @@ class RAGChain:
             report.ticker, report.risk_score, report.confidence,
         )
 
-        return report
+        # Return the parent blocks — that is the text the LLM actually read,
+        # so citation-faithfulness checks compare against the right source.
+        return report, parents
 
 
 def create_rag_chain(
@@ -232,7 +266,7 @@ class ChatChain:
         llm: Any | None = None,
         rerank_top_n: int = 6,
     ):
-        self._retriever = Retriever(vector_store, config=retriever_config)
+        self._retriever = HybridRetriever(vector_store, config=retriever_config)
         self._reranker = reranker or NoOpReranker(top_n=rerank_top_n)
         self._llm = llm or ChatAnthropic(
             model="claude-haiku-4-5-20251001",
@@ -240,6 +274,7 @@ class ChatChain:
             max_tokens=1024,
             api_key=os.getenv("CLAUDE_API_KEY") or os.getenv("ANTHROPIC_API_KEY"),
             streaming=True,
+            max_retries=8,
         )
 
     def _build_messages(
@@ -274,7 +309,11 @@ class ChatChain:
                 top_k=top_k,
             )
         reranked = self._reranker.rerank(question, chunks) if chunks else []
-        context = format_chunks_as_context(reranked)
+        # Parent-document expansion: read full blocks, not 500-token slivers;
+        # capped so the prompt stays within model input limits.
+        parents = expand_to_parents(reranked) if reranked else []
+        parents = cap_context_tokens(parents, MAX_CONTEXT_TOKENS)
+        context = format_chunks_as_context(parents)
 
         messages: list[dict] = [
             {"role": "system", "content": CHAT_SYSTEM_PROMPT.format(context=context)},
@@ -285,7 +324,7 @@ class ChatChain:
         messages.append(
             {"role": "user", "content": CHAT_USER_PROMPT.format(ticker=ticker.upper(), question=question)},
         )
-        return messages, reranked
+        return messages, parents
 
     def invoke(
         self,

@@ -17,8 +17,15 @@ htmlcov
 !.env.example
 *.log
 Docs
+docs
 tests
 frontend
+evals
+mlruns
+mlflow.db
+chroma_data
+.claude
+.github
 *.md
 !README.md
 Abdelmageed_credentials.csv
