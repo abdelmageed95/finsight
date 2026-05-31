@@ -1,0 +1,140 @@
+# Continuous deployment — on every push to main (and on manual dispatch):
+# run the unit tests, then build + push both images, run the DB migration,
+# and roll the ECS services. This is the automated form of
+# infra/scripts/deploy.sh.
+#
+# Prerequisites (one-time):
+#   * `terraform apply` has created the infrastructure.
+#   * The GitHub repo has an Actions *variable* AWS_DEPLOY_ROLE_ARN set to the
+#     `github_actions_role_arn` Terraform output.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# OIDC: id-token write lets the job request a short-lived AWS credential.
+permissions:
+  id-token: write
+  contents: read
+
+# Never run two production deploys at once.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  NAME_PREFIX: finsight-prod
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
+
+      - name: Unit tests
+        run: pytest tests/unit/ -v
+
+  deploy:
+    name: Build, migrate & deploy
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve infrastructure values
+        id: infra
+        run: |
+          set -euo pipefail
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --names "$NAME_PREFIX-alb" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=$NAME_PREFIX-private-*" \
+            --query 'Subnets[].SubnetId' --output text | tr -s '[:space:]' ',' | sed 's/,$//')
+          SG=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$NAME_PREFIX-ecs-api-sg" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          echo "alb_url=http://$ALB_DNS" >> "$GITHUB_OUTPUT"
+          echo "subnets=$SUBNETS"        >> "$GITHUB_OUTPUT"
+          echo "sg=$SG"                  >> "$GITHUB_OUTPUT"
+
+      - name: Build & push API image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$NAME_PREFIX-api"
+          docker build -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" .
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Build & push frontend image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$NAME_PREFIX-frontend"
+          docker build \
+            --build-arg NEXT_PUBLIC_API_URL="${{ steps.infra.outputs.alb_url }}" \
+            -t "$IMAGE:latest" -t "$IMAGE:${{ github.sha }}" ./frontend
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Run database migration
+        run: |
+          set -euo pipefail
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$NAME_PREFIX-cluster" \
+            --task-definition "$NAME_PREFIX-migrate" \
+            --launch-type FARGATE \
+            --network-configuration \
+              "awsvpcConfiguration={subnets=[${{ steps.infra.outputs.subnets }}],securityGroups=[${{ steps.infra.outputs.sg }}],assignPublicIp=DISABLED}" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Migration task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "$NAME_PREFIX-cluster" --tasks "$TASK_ARN"
+          EXIT=$(aws ecs describe-tasks --cluster "$NAME_PREFIX-cluster" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          echo "Migration exit code: $EXIT"
+          [ "$EXIT" = "0" ] || { echo "::error::Database migration failed"; exit 1; }
+
+      - name: Roll ECS services
+        run: |
+          set -euo pipefail
+          aws ecs update-service --cluster "$NAME_PREFIX-cluster" \
+            --service "$NAME_PREFIX-api" --force-new-deployment >/dev/null
+          aws ecs update-service --cluster "$NAME_PREFIX-cluster" \
+            --service "$NAME_PREFIX-frontend" --force-new-deployment >/dev/null
+          echo "Waiting for services to stabilise..."
+          aws ecs wait services-stable --cluster "$NAME_PREFIX-cluster" \
+            --services "$NAME_PREFIX-api" "$NAME_PREFIX-frontend"
+
+      - name: Summary
+        run: |
+          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "App: ${{ steps.infra.outputs.alb_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image tag: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"

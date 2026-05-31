@@ -23,7 +23,7 @@ def main(ticker: str, question: str):
     from agents.orchestrator import build_graph
     from langchain_core.messages import HumanMessage
 
-    print(f"Building FinSight graph...")
+    print("Building FinSight graph...")
     graph = build_graph()
 
     print(f"\nTicker:   {ticker}")

@@ -35,7 +35,6 @@ export function RiskGauge({ score, size = 180, label, className }: RiskGaugeProp
   // Semicircle arc geometry
   const strokeWidth = 14;
   const radius = (size - strokeWidth) / 2;
-  const cx = size / 2;
   const cy = size / 2;
   // half circumference (π r) is the full arc length for a semicircle
   const arcLength = Math.PI * radius;

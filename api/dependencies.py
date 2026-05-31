@@ -6,11 +6,12 @@ import os
 from datetime import datetime, timedelta
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, status
 from jose import JWTError, jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from db.models import User
 from db.session import async_session_factory
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,6 @@ async def get_current_user(
     token = authorization.removeprefix("Bearer ").strip()
     user_id = decode_token(token)
 
-    from db.models import User
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -101,7 +101,6 @@ async def get_optional_user(
     token = authorization.removeprefix("Bearer ").strip()
     user_id = decode_token(token)
 
-    from db.models import User
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     return user
@@ -109,5 +108,5 @@ async def get_optional_user(
 
 # Type aliases for cleaner dependency injection
 DbSession = Annotated[AsyncSession, Depends(get_db)]
-CurrentUser = Annotated["db.models.User", Depends(get_current_user)]
-OptionalUser = Annotated["db.models.User | None", Depends(get_optional_user)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
+OptionalUser = Annotated[User | None, Depends(get_optional_user)]

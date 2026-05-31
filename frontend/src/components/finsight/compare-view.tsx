@@ -6,7 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, GitCompareArrows, Loader2, Trophy } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 
 interface MetricComparison {

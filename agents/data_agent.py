@@ -60,7 +60,7 @@ def data_agent_node(state: "GraphState") -> Command[Literal["supervisor"]]:
     # 1. Running in main thread with event loop (direct invoke)
     # 2. Running in a background thread (via asyncio.to_thread)
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
         # We're inside an async context — use nest_asyncio or run in new loop
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:

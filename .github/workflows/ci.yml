@@ -1,0 +1,61 @@
+# Continuous integration — runs on every pull request and on pushes to any
+# branch except main. Pushes to main are handled by deploy.yml (which runs the
+# same tests before deploying).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+jobs:
+  backend:
+    name: Backend — lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch — avoids the multi-GB CUDA wheel on the runner.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Unit tests
+        run: pytest tests/unit/ -v
+
+  frontend:
+    name: Frontend — lint & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+        env:
+          # Placeholder — the real value is baked in at deploy time (deploy.yml).
+          NEXT_PUBLIC_API_URL: http://localhost:8000

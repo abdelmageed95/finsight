@@ -47,12 +47,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
   useEffect(() => {
+    // Hydrating auth state from localStorage on mount. SSR can't read
+    // localStorage so this must run client-side after first render.
     const t = getToken();
     const u = getUser();
     if (t && u) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setToken(t);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setUser(u);
     }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsLoading(false);
   }, []);
 

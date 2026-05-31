@@ -30,7 +30,7 @@ infra/terraform/.terraform/
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.backup
 infra/terraform/terraform.tfvars
-
+terraform.tfstate
 # Alembic
 alembic.ini.local
 
@@ -49,7 +49,7 @@ chroma_data/
 
 .claude
 CLAUDE.md
-.github
+
 .pytest_cache
 
 Docs/
@@ -100,3 +100,32 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Terraform state — contains secrets
+terraform.tfstate
+terraform.tfstate.
+  backup
+*.tfstate
+*.tfstate.*
+.terraform/
+
+
+# Secrets, never commit
+.env
+.env.*
+env.example
+
+# Terraform — state, plans, vars, lock dirs
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+tfplan
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+
+# AWS
+.aws/credentials
+EOF

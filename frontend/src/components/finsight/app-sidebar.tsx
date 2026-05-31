@@ -18,12 +18,15 @@ function useWorkspaceHref() {
 
   useEffect(() => {
     if (pathname.startsWith("/workspace/")) {
-      // Strip query string when remembering
       const base = pathname.split("?")[0];
+      // Hydrating from external state (URL) — one-shot on pathname change.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setHref(base);
       return;
     }
     const last = window.localStorage.getItem("finsight.lastTicker");
+    // Hydrating from external state (localStorage) — runs after mount only.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (last) setHref(`/workspace/${last}`);
   }, [pathname]);
 
