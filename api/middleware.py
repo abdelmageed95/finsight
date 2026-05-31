@@ -7,7 +7,7 @@ import time
 import uuid
 
 import structlog
-from fastapi import FastAPI, Request, Response
+from fastapi import Request
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address

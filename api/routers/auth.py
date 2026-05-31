@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 import bcrypt

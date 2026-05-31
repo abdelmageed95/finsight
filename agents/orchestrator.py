@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import operator
 import os
 from datetime import datetime
 from typing import Annotated, Any, Literal
@@ -27,7 +26,7 @@ from typing import Annotated, Any, Literal
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_anthropic import ChatAnthropic
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -272,7 +271,7 @@ def smalltalk_agent_node(state: GraphState) -> Command[Literal["__end__"]]:
             HumanMessage(content=question),
         ])
         reply = response.content.strip() if hasattr(response, "content") else str(response)
-    except Exception as e:
+    except Exception:
         logger.exception("Smalltalk generation failed")
         reply = "Hi! I'm FinSight. Ask me about any public company and I'll pull recent filings and market data to produce a cited research summary."
 

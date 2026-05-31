@@ -43,12 +43,12 @@ def main():
     print(f"\nSUMMARY:\n{report.summary}")
 
     if report.key_metrics:
-        print(f"\nKEY METRICS:")
+        print("\nKEY METRICS:")
         for m in report.key_metrics:
             print(f"  - {m.name}: {m.value} ({m.trend}) — {m.context}")
 
     if report.citations:
-        print(f"\nCITATIONS:")
+        print("\nCITATIONS:")
         for c in report.citations:
             print(f"  [Source {c.source_index}] {c.doc_type}: {c.excerpt[:100]}")
 

@@ -7,7 +7,6 @@ normalisation, and metadata.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
@@ -141,21 +140,21 @@ def _format_report_text(report: dict) -> str:
         f"{'=' * 60}",
         f"  FINSIGHT RESEARCH REPORT — {report['ticker']}",
         f"{'=' * 60}",
-        f"",
+        "",
         f"Question: {report['question']}",
         f"Generated: {report['generated_at']}",
         f"Confidence: {report['confidence'].upper()}",
-        f"",
-        f"--- Risk Assessment ---",
+        "",
+        "--- Risk Assessment ---",
         risk_line,
         rationale_line,
-        f"",
-        f"--- Summary ---",
+        "",
+        "--- Summary ---",
         f"{report['summary']}",
     ]
 
     if report.get("key_metrics"):
-        lines.append(f"\n--- Key Metrics ---")
+        lines.append("\n--- Key Metrics ---")
         for m in report["key_metrics"]:
             name = m.get("name", "")
             value = m.get("value", "")
@@ -164,7 +163,7 @@ def _format_report_text(report: dict) -> str:
             lines.append(f"  {name}: {value} ({trend}) — {context}")
 
     if report.get("citations"):
-        lines.append(f"\n--- Citations ---")
+        lines.append("\n--- Citations ---")
         for c in report["citations"]:
             lines.append(f"  [Source {c.get('source_index', '?')}] {c.get('doc_type', '')}: {c.get('excerpt', '')[:100]}")
 

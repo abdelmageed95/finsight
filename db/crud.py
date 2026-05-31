@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Chunk, Conversation, ConversationTurn, Filing, Financials, Price, Ticker
+from db.models import Conversation, ConversationTurn, Filing, Price, Ticker
 
 
 async def get_or_create_ticker(session: AsyncSession, symbol: str, **kwargs) -> Ticker:
