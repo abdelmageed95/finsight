@@ -34,10 +34,13 @@ data "aws_iam_policy_document" "github_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
+    # Pin to the main branch — the deploy workflow only runs on push to main.
+    # The `:*` wildcard would let any branch, tag, or workflow_dispatch from a
+    # feature branch assume the production deploy role.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
     }
   }
 }
@@ -61,8 +64,6 @@ data "aws_iam_policy_document" "github_deploy" {
     sid = "ECRPush"
     actions = [
       "ecr:BatchCheckLayerAvailability",
-      "ecr:BatchGetImage",
-      "ecr:GetDownloadUrlForLayer",
       "ecr:InitiateLayerUpload",
       "ecr:UploadLayerPart",
       "ecr:CompleteLayerUpload",
