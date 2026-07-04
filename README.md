@@ -18,6 +18,7 @@ The whole pipeline runs behind a FastAPI backend, with a Next.js finance-termina
 ## Table of contents
 
 - [Architecture at a glance](#architecture-at-a-glance)
+- [System diagrams](#system-diagrams)
 - [Deeper reading](#deeper-reading)
 - [Tech stack](#tech-stack)
 - [Repository layout](#repository-layout)
@@ -77,7 +78,7 @@ The whole pipeline runs behind a FastAPI backend, with a Next.js finance-termina
    └─────────────────────────────────────┘
 ```
 
-The graph is wired in `agents/orchestrator.py`; each node lives in its own file under `agents/`. The retrieval chain is in `rag/chain.py`.
+The graph is wired in `agents/orchestrator.py`; each node lives in its own file under `agents/`. The retrieval chain is in `rag/chain.py`. For the full visual tour — cloud topology, data flows, deployment, and state machines — see [System diagrams](#system-diagrams) below.
 
 **Models.** Every LLM call — intent classification, smalltalk, RAG report generation, stock comparison, and the eval LLM-as-judge — runs on **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`). OpenAI is used **only** for embeddings (`text-embedding-3-large`). Nothing else touches OpenAI for generation.
 
@@ -97,6 +98,168 @@ The graph is wired in `agents/orchestrator.py`; each node lives in its own file 
 An `APScheduler` job (`SCHEDULER_ENABLED=true` by default) also refreshes every tracked ticker every 6 hours, so users returning after days see fresh data immediately on their first query. Users can also hit the **"Refresh"** button on a workspace's Overview tab to re-pull prices + news immediately without regenerating the report.
 
 **International coverage.** yfinance handles US tickers out of the box; for other markets the Data Agent auto-tries exchange suffixes (`.SR` Tadawul, `.AE` ADX/DFM, `.QA` Qatar, `.KW` Kuwait, `.BH` Bahrain, `.CA` Egypt, `.L` London, `.TO` Toronto, `.HK` Hong Kong), then falls through to Massive, Twelve Data, EODHD, and Tiingo in order. EODHD in particular has strong Middle East + EMEA coverage (70+ exchanges).
+
+---
+
+## System diagrams
+
+A picture-first tour of the system — zoom out, then zoom in. Each topic below shows its primary diagram; secondary and zoom-in views live in the expandable blocks. Every diagram's accompanying prose is in [`docs/system-diagrams.md`](docs/system-diagrams.md).
+
+| Architecture | Flows, data & security | Delivery & ops |
+|---|---|---|
+| [1 · The big picture](#1-the-big-picture) | [5 · User journeys](#5-end-to-end-user-journeys) | [9 · Deployment workflow](#9-deployment-workflow) |
+| [2 · Layered architecture](#2-layered-architecture) | [6 · Data flows](#6-data-flows) | [10 · CI/CD pipeline](#10-cicd-pipeline) |
+| [3 · Cloud topology](#3-cloud-deployment-topology) | [7 · Database & ER](#7-database-and-entity-relationships) | [11 · Observability](#11-observability) |
+| [4 · Multi-agent pipeline](#4-multi-agent-pipeline-langgraph) | [8 · Security](#8-security-and-defense-in-depth) | [12 · State machines](#12-state-machines) |
+
+### 1. The big picture
+
+Users hit a public ALB, which splits traffic between the Next.js frontend and the FastAPI backend; the backend reaches three private stores (Postgres, Redis, ChromaDB) and calls external APIs through a NAT gateway.
+
+![The big picture](docs/images/01_big_picture.png)
+
+### 2. Layered architecture
+
+Five layers — presentation → HTTP API → LangGraph orchestration → infrastructure → data stores — each talking only to the one directly below it.
+
+![Layered architecture](docs/images/02_layered_architecture.png)
+
+### 3. Cloud deployment topology
+
+The §1 picture with VPC / subnet / AZ detail. The security-group chain ensures nothing reaches the database without first passing through an API task.
+
+![Cloud deployment topology](docs/images/03_cloud_topology.png)
+
+<details>
+<summary>Zoom in — security-group chain</summary>
+
+![Security-group chain](docs/images/04_security_group_chain.png)
+
+</details>
+
+### 4. Multi-agent pipeline (LangGraph)
+
+`supervisor` is the entry point; it routes each turn to `smalltalk_agent` or the `data_agent → rag_agent → report_agent` chain via `Command(goto=...)`.
+
+![LangGraph top-level graph](docs/images/05_langgraph_top_level.png)
+
+<details>
+<summary>Zoom in — supervisor decision · DataAgent fallback · RAGAgent path</summary>
+
+![Supervisor intent decision](docs/images/06_supervisor_decision.png)
+
+![DataAgent multi-source fallback](docs/images/07_data_agent_fallback.png)
+
+![RAGAgent retrieve → rerank → generate](docs/images/08_rag_agent_pipeline.png)
+
+</details>
+
+### 5. End-to-end user journeys
+
+The flagship flow: `POST /analyze` starts a background LangGraph run; the browser polls `/report/{job_id}` until it completes (15–40 s).
+
+![Journey — analyse a ticker](docs/images/10_journey_b_analyze_ticker.png)
+
+<details>
+<summary>Other journeys — login · chat (no report created) · compare two tickers</summary>
+
+![Login](docs/images/09_journey_a_login.png)
+
+![Chat about a report](docs/images/11_journey_c_chat.png)
+
+![Compare two tickers](docs/images/12_journey_d_compare.png)
+
+</details>
+
+### 6. Data flows
+
+Ingestion: external sources → pipelines → Postgres + ChromaDB.
+
+![Ingestion pipeline](docs/images/13_ingestion_pipeline.png)
+
+<details>
+<summary>Zoom in — content_hash re-embedding trigger · retrieval read path</summary>
+
+![Re-embedding trigger](docs/images/14_reembedding_trigger.png)
+
+![Retrieval pipeline](docs/images/15_retrieval_pipeline.png)
+
+</details>
+
+### 7. Database and entity relationships
+
+The Alembic-managed relational schema and how the tables relate.
+
+![Database entity relationships](docs/images/16_database_er.png)
+
+<details>
+<summary>Zoom in — AnalysisReport.status transitions</summary>
+
+![Status transitions](docs/images/17_status_transitions.png)
+
+</details>
+
+### 8. Security and defense in depth
+
+Seven independent layers between an attacker and your data.
+
+![Security — defense in depth](docs/images/18_defense_in_depth.png)
+
+<details>
+<summary>Zoom in — where secrets travel (laptop → Secrets Manager → container memory)</summary>
+
+![Where secrets travel](docs/images/19_secrets_travel.png)
+
+</details>
+
+### 9. Deployment workflow
+
+First deploy: one-time setup → Terraform provision → ship code & schema → wire GitHub. Redeploys are just the ship step.
+
+![First-time deploy](docs/images/20_first_time_deploy.png)
+
+### 10. CI/CD pipeline
+
+`deploy.yml` on push to `main`: OIDC token exchange → build & push images → run migrations → zero-downtime rolling update.
+
+![Deploy workflow](docs/images/22_cicd_deploy_yml.png)
+
+<details>
+<summary>Zoom in — ci.yml PR gate (never touches AWS) · rolling-update timeline</summary>
+
+![CI workflow](docs/images/21_cicd_ci_yml.png)
+
+![Rolling update](docs/images/23_rolling_update.png)
+
+</details>
+
+### 11. Observability
+
+Three layers of "what's going on?" — logs → alarms → dashboard.
+
+![Observability layers](docs/images/24_observability_layers.png)
+
+<details>
+<summary>Zoom in — alarm signal flow (metric → threshold → SNS → inbox)</summary>
+
+![Alarm signal flow](docs/images/25_alarm_signal_flow.png)
+
+</details>
+
+### 12. State machines
+
+The analysis job lifecycle: pending → running → completed / failed, with re-runs marking the old report `overwritten`.
+
+![Background analysis job](docs/images/26_background_job_state_machine.png)
+
+<details>
+<summary>Zoom in — ECS task lifecycle · CloudWatch alarm states</summary>
+
+![ECS task lifecycle](docs/images/27_ecs_task_lifecycle.png)
+
+![CloudWatch alarm](docs/images/28_cloudwatch_alarm_state.png)
+
+</details>
 
 ---
 
@@ -758,29 +921,4 @@ docker compose -f docker/docker-compose.yml up -d --build
 
 ---
 
-## Project status
-
-This repo is being built week-by-week from `Docs/project_proposal.md`. Current state:
-
-- **Weeks 1–4** — Data pipelines, DB models, RAG chain, multi-agent graph, FastAPI endpoints, auth, tests. Done.
-- **Week 5** — Docker Compose stack for local dev. Done.
-- **Week 9** — Next.js frontend (dashboard, chat, reports). Done.
-- **Product hardening pass 1** — Intent-aware supervisor + smalltalk agent so greetings no longer trigger the full research pipeline; default SEC form types include 10-Q; scheduler enabled by default. Done.
-- **Product hardening pass 2** — Per-source freshness TTLs in the Data Agent (market 15 min, SEC 24 h); financials upsert instead of no-op; `Filing.content_hash` + `embedded_content_hash` with automatic re-embedding when filings change; legacy backfill for existing rows. Done.
-- **Product hardening pass 3** — Persistent conversations with multi-turn context. `Conversation` + `ConversationTurn` models, CRUD helpers, `/conversations` API endpoints, frontend sidebar with conversation list and history restore, prior turns injected into the RAG chain prompt. Also: code cleanup — extracted shared `content_hash` helper, deduplicated Chroma collection access, eliminated N+1 query in the embedder, optimized legacy backfill to avoid loading full filing text into Python. Done.
-- **Auth + chat separation** — Email/password + Google OAuth authentication. Separated analysis pipeline from chat: `/analyze` runs the full multi-agent pipeline and generates reports; `/conversations/{id}/messages` runs lightweight RAG for quick Q&A without creating reports. Re-analysis support with "overwrite" semantics for existing reports. User isolation across all endpoints. Done.
-- **Enrichment pass 1 — Quick wins** — Added KPI cards (net income, EPS, gross margin), filing timeline with SEC links, report history per ticker. Done.
-- **Enrichment pass 2 — New visualizations** — Revenue vs Net Income trend chart, SMA/Bollinger overlays on candlestick chart, 30-day volatility sparkline, risk score breakdown (4 sub-categories), sector peer comparison table, metrics trend across re-analyses. Done.
-- **Enrichment pass 3 — New data sources** — News sentiment feed (Alpha Vantage → Postgres persistence → frontend card), institutional holders (yfinance live), earnings calendar with EPS beat/miss bars, dividend history with yield/payout ratio. All served via new `/ticker/{symbol}/*` endpoints. Done.
-- **Enrichment pass 4 — Report enhancements** — SWOT analysis (2x2 grid in reports), bull vs bear investment thesis cards, client-side PDF export (html2canvas + jsPDF), stock comparison page (`/compare`) with `POST /analyze/compare` endpoint, metric-by-metric head-to-head table with winner highlighting. Done.
-- **Report page deep enhancement** — 14 improvements to the report detail view: sticky TOC sidebar with anchor links, collapsible sections, live price snapshot strip with 30-day sparkline, executive summary banner, revenue segmentation bars with trend indicators, competitive moat card with rating badge, valuation verdict card, catalysts list with impact-colored icons, management assessment card, market context section (news + peers), follow-up question suggestions, share-as-image (Web Share API), enhanced metric tiles with trend arrows. Six new AI-generated fields added to the RAG schema and prompt (executive summary, catalysts, competitive moat, revenue segments, management assessment, valuation verdict). Done.
-- **International coverage pass** — Multi-source data fallback chain (yfinance → Massive → Twelve Data → EODHD → Tiingo) with automatic exchange-suffix detection so Middle East tickers (Tadawul `.SR`, ADX/DFM `.AE`, EGX `.CA`, QSE `.QA`, Kuwait `.KW`, Bahrain `.BH`) and other international markets resolve without manual configuration. News fallback chain (Alpha Vantage → Massive → EODHD → Tiingo). Source provider is reported back in the ingestion result. Dashboard "Refresh data" button + `POST /ticker/{symbol}/refresh` endpoint for on-demand market/news refresh. localStorage caching for the last comparison view. Progressive-backoff polling. Done.
-- **RAG pipeline overhaul** — Upgraded embeddings to `text-embedding-3-large` (3072 dims). Section-aware filing parser that walks the DOM for SEC Item headers (Item 1, 1A, 7, 7A, 8, …) and emits per-section chunks with `section_name` / `item_number` / `chunk_type` metadata. HTML tables extracted as markdown and embedded as separate `chunk_type="table"` chunks prefixed with their originating section. Switched from character-level to token-level splitting with tiktoken `cl100k_base` (512 tokens, 64 overlap). `max_filings` raised from 5 → 10. Split retrieval strategies: **report mode** (`agents/rag_agent.py`) over-fetches and filters to the latest 10-K + latest 10-Q only with cross-encoder reranking, keeping reports tied to the most current disclosures; **chat mode** (`/conversations/{id}/messages`) retrieves across all filings for historical depth. Both modes use `top_k=16`. Source headers in the LLM context now include section name and `[table]` tag. Done.
-- **Information architecture refactor** — Collapsed the separate `/dashboard`, `/chat`, and `/reports` pages into a single per-ticker **workspace** (`/workspace/{ticker}`) with Overview / Research / Chat tabs driven by a `?tab=` URL param, plus a `/home` launcher + cross-ticker activity feed. Live market data now lives only in Overview, AI reports only in Research — no more duplicated panels across pages. Legacy routes redirect so existing links keep working. Done.
-- **Evaluation harness** — `tests/evals/`: an offline eval suite that runs the real LangGraph pipeline over a curated `dataset.jsonl` and scores each row on citation faithfulness, factuality, refusal correctness, and risk-band accuracy, with an optional disk-cached LLM-as-judge. Surfaces quality regressions unit tests can't. Optional `--mlflow` flag logs each run (params, metrics, artifacts) to an MLflow experiment for cross-run comparison. Done.
-- **Reliability + correctness pass** — `risk_score` made nullable so sparse retrieval surfaces an honest "insufficient data" instead of a fabricated placeholder; tolerant Pydantic validators coerce stray LLM prose in list fields rather than failing the whole report; SEC ingestion lowered to 4 filings and downloads them concurrently with retry/backoff; ChromaDB upserts batched to stay under payload limits; the cross-encoder reranker model cached process-wide instead of reloading per request; reports keyed by question so distinct questions each keep their own report; frontend timestamps parsed as UTC. Done.
-- **Temporal retrieval** — Four-layer defense against dense retrieval picking the wrong fiscal year: SEC `reportDate` captured on `Filing.period_of_report` (new migration); a temporal header (`[NVDA · 10-K · FY2025 · Item 7]`) prepended to every chunk before embedding plus a `fiscal_year` metadata tag; query time-intent extraction (`rag/temporal.py` — explicit years, `FY25`, relative phrases); and a soft ChromaDB `fiscal_year` filter that relaxes to unfiltered when too sparse. Done.
-- **Model standardization** — All LLM calls (intent classification, smalltalk, RAG generation, comparison, eval judge) consolidated on **Claude Haiku 4.5** (`claude-haiku-4-5-20251001`); OpenAI is now used exclusively for embeddings. Done.
-- **Weeks 6–8 (AWS infra, CI/CD, deployment)** — Deferred until the end-to-end product is stable locally.
-
-The AWS deployment, CI/CD, and production hardening sections of the proposal are intentionally **not** covered in this README yet — they will be added when that work begins.
+The AWS deployment, CI/CD, and observability **designs** are captured in [System diagrams](#system-diagrams) (§3, §8–§12) and in full in [`docs/system-diagrams.md`](docs/system-diagrams.md); the hands-on provisioning and production-hardening work (Weeks 6–8) is still in progress.
