@@ -9,7 +9,8 @@ build/
 .venv/
 venv/
 env/
-
+.ruff_cache
+docs/databases/access_db.md
 # Environment
 .env
 .env.local
